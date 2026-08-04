@@ -102,8 +102,13 @@ class CheckMaliciousMessagePlugin(Star):
     @filter.on_astrbot_loaded()
     async def _on_loaded(self):
         """AstrBot 初始化完成后启动后台衰减任务。"""
-        if self._decrement_task is None or self._decrement_task.done():
-            self._decrement_task = asyncio.create_task(self._decrement_loop())
+        if self._decrement_task is not None and not self._decrement_task.done():
+            self._decrement_task.cancel()
+            try:
+                await self._decrement_task
+            except asyncio.CancelledError:
+                pass
+        self._decrement_task = asyncio.create_task(self._decrement_loop())
 
     async def terminate(self):
         """插件卸载 / 停用时调用。"""
@@ -220,7 +225,7 @@ class CheckMaliciousMessagePlugin(Star):
 
         # 生成警告文案（以当前人格语气；可禁言场景会包含 x/禁言提示）
         warn_text = await self._generate_warning(
-            umo, rec, reason, x, mute_capable, muted, mute_minutes
+            umo, rec, reason, x, mute_capable, muted, mute_minutes, message_str
         )
         logger.info(
             f"[恶意消息检测] 命中恶意 sender={sender_id} x={x} umo={umo} "
@@ -311,12 +316,14 @@ class CheckMaliciousMessagePlugin(Star):
         mute_capable: bool,
         muted: bool,
         mute_minutes: int,
+        message_str: str = "",
     ) -> str:
         """以 LLM 当前人格的语气生成警告文案。
 
         - 可禁言场景（mute_capable=True）：必须告知当前累计次数 x，并按 x 与阈值的关系
           给出禁言提示（见 _build_mute_hint）。
         - 不可禁言场景（私聊/机器人非管理员群）：只告知累计 x，不提禁言。
+        - 警告中会引用被警告的消息原文与判定原因，让被警告者清楚知道原因。
         失败时回退到模板。
         """
         cfg = self.config
@@ -336,18 +343,26 @@ class CheckMaliciousMessagePlugin(Star):
         mute_hint = self._build_mute_hint(x, mute_capable, muted, mute_minutes)
 
         if not provider_id or not persona_prompt:
-            return self._template_warning(rec, reason, mute_hint)
+            return self._template_warning(rec, reason, mute_hint, message_str)
 
         system_prompt = (
             persona_prompt.rstrip()
             + "\n\n[附加任务] 你现在需要以你的人格设定和语气，对一名刚刚发送了恶意消息的用户"
-            "发出简短、有威慑力但符合你人设的警告。要求：不超过 100 字，只输出警告正文，"
-            "不要输出引号、JSON 或任何解释。必须自然地包含给定的累计次数与禁言提示信息。"
+            "发出简短、有威慑力但符合你人设的警告。要求：不超过 150 字，只输出警告正文，"
+            "不要输出引号、JSON 或任何解释。必须自然地包含："
+            "1) 被警告的消息原文摘要（不超过 50 字，用「」或引号引用）；"
+            "2) 清晰的判定原因；"
+            "3) 给定的累计次数与禁言提示信息。"
         )
+        quoted_msg = ""
+        if message_str:
+            snippet = message_str[:50] + ("…" if len(message_str) > 50 else "")
+            quoted_msg = f"\n被警告的消息原文：「{snippet}」"
         user_prompt = (
             f"用户 {rec.get('sender_name') or '该用户'} 发送了恶意消息。"
             f"判定原因：{reason or '含有严重恶意内容'}。\n"
-            f"这是该用户第 {x} 次被警告，历史累计 {rec.get('total', x)} 次。\n"
+            f"这是该用户第 {x} 次被警告，历史累计 {rec.get('total', x)} 次。"
+            f"{quoted_msg}\n"
             f"请在警告中包含以下信息（用你自己的语气表达，数字必须准确）：\n{mute_hint}"
         )
         try:
@@ -361,7 +376,7 @@ class CheckMaliciousMessagePlugin(Star):
                 return text
         except Exception as e:
             logger.warning(f"[恶意消息检测] 警告文案生成失败，回退模板: {e}")
-        return self._template_warning(rec, reason, mute_hint)
+        return self._template_warning(rec, reason, mute_hint, message_str)
 
     def _build_mute_hint(
         self, x: int, mute_capable: bool, muted: bool, mute_minutes: int
@@ -437,14 +452,23 @@ class CheckMaliciousMessagePlugin(Star):
             return persona.get("prompt", "") or ""
         return getattr(persona, "prompt", "") or ""
 
-    def _template_warning(self, rec: dict, reason: str, mute_hint: str = "") -> str:
-        """LLM 不可用时的模板警告。"""
+    def _template_warning(self, rec: dict, reason: str, mute_hint: str = "", message_str: str = "") -> str:
+        """LLM 不可用时的模板警告。包含消息原文引用与清晰原因。"""
         cfg = self.config
         tpl = cfg.get("warn_message") or DEFAULT_WARN_MESSAGE
         text = tpl.replace("{sender}", rec.get("sender_name") or "该用户")
         text = text.replace("{x}", str(rec.get("count", 0)))
         if reason and "{reason}" in text:
             text = text.replace("{reason}", reason)
+        # 追加引用消息与清晰原因
+        parts = []
+        if message_str:
+            snippet = message_str[:80] + ("…" if len(message_str) > 80 else "")
+            parts.append(f"📎 你发送的消息：「{snippet}」")
+        if reason:
+            parts.append(f"🔍 判定原因：{reason}")
+        if parts:
+            text = text + "\n" + "\n".join(parts)
         if mute_hint:
             text = text + "\n" + mute_hint
         return text
@@ -603,24 +627,48 @@ class CheckMaliciousMessagePlugin(Star):
             self._logs = self._logs[-500:]
 
     async def _decrement_loop(self):
-        """每 2 小时将所有人的 count - 1（不低于 0）。"""
+        """按 last_decrement 时间戳计算下一次衰减时刻，确保重载后倒计时一致。
+
+        逻辑：
+        - 每次衰减后记录 last_decrement = now
+        - 下一次衰减时间 = last_decrement + DECAY_INTERVAL
+        - 若当前已超过下次衰减时间（如停机期间错过了），立即补做一次
+        """
         while True:
             try:
-                await asyncio.sleep(DECAY_INTERVAL)
-                changed = False
-                for rec in self._records.values():
-                    if rec.get("count", 0) > 0:
-                        rec["count"] = max(0, rec.get("count", 0) - 1)
-                        changed = True
-                self._meta["last_decrement"] = time.time()
-                if changed:
-                    self._save()
-                    logger.info("[恶意消息检测] 每 2 小时衰减：所有用户警告次数 -1")
+                now = time.time()
+                last = float(self._meta.get("last_decrement", now) or now)
+                next_fire = last + DECAY_INTERVAL
+                if next_fire <= now:
+                    # 已到期（可能是重载前就该衰减了），立即执行
+                    await self._do_decrement()
+                    continue  # 继续循环，重新计算下一次
+                # 等到下次衰减时刻
+                wait = next_fire - time.time()
+                # 分段等待，避免一次 sleep 过长无法及时响应
+                while wait > 0:
+                    chunk = min(wait, 60)
+                    await asyncio.sleep(chunk)
+                    wait -= chunk
+                    if time.time() >= next_fire:
+                        break
             except asyncio.CancelledError:
                 raise
             except Exception as e:
                 logger.warning(f"[恶意消息检测] 衰减任务异常: {e}")
                 await asyncio.sleep(60)
+
+    async def _do_decrement(self):
+        """执行一次衰减：所有用户 count -1（不低于 0）。"""
+        changed = False
+        for rec in self._records.values():
+            if rec.get("count", 0) > 0:
+                rec["count"] = max(0, rec.get("count", 0) - 1)
+                changed = True
+        self._meta["last_decrement"] = time.time()
+        if changed:
+            self._save()
+        logger.info("[恶意消息检测] 每 2 小时衰减：所有用户警告次数 -1")
 
     def _apply_pending_decrements(self):
         """加载时补算停机期间应衰减的次数。"""
@@ -682,13 +730,25 @@ class CheckMaliciousMessagePlugin(Star):
         sender_id: str,
         warn_text: str,
     ) -> MessageEventResult:
-        """构造警告消息结果（x/禁言提示已包含在 warn_text 中）。"""
+        """构造警告消息结果（x/禁言提示已包含在 warn_text 中）。
+
+        使用 reply() 引用被警告的原消息，让用户清楚知道是哪条消息触发的警告。
+        """
         cfg = self.config
         result = event.make_result()
+        # 优先使用 reply 引用原消息，让被警告者清楚知道是哪条消息触发的
         if bool(cfg.get("warn_at_sender", True)) and sender_id:
+            try:
+                result.reply(event.message_id, " ")
+            except Exception:
+                pass
             result.at(event.get_sender_name() or sender_id, sender_id)
             result.message(" " + warn_text)
         else:
+            try:
+                result.reply(event.message_id, " ")
+            except Exception:
+                pass
             result.message(warn_text)
 
         if bool(cfg.get("stop_event", True)):
