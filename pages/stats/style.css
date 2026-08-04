@@ -226,6 +226,27 @@ td.msg {
   background: var(--high);
 }
 
+.badge.special {
+  background: #f0e7ff;
+  color: #6b21a8;
+}
+
+.badge.admin {
+  background: #e0f2fe;
+  color: #0369a1;
+  font-size: 11px;
+}
+
+.btn.small.danger {
+  background: #fff;
+  color: var(--high);
+  border-color: var(--high);
+}
+
+.btn.small.danger:hover {
+  background: #fff0f0;
+}
+
 .empty {
   text-align: center;
   color: var(--muted);
