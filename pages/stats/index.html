@@ -24,6 +24,8 @@
     <nav class="tabs">
       <button class="tab active" data-tab="stats">警告次数统计</button>
       <button class="tab" data-tab="logs">被警告消息备案</button>
+      <button class="tab" data-tab="special">特殊记录</button>
+      <button class="tab" data-tab="timeout">超时记录</button>
     </nav>
 
     <section class="summary" id="summary">加载中…</section>
@@ -71,6 +73,51 @@
         </table>
       </div>
       <p class="empty" id="logEmpty" hidden>暂无被警告消息备案。</p>
+    </section>
+
+    <!-- Tab: 特殊记录 -->
+    <section id="pane-special" class="pane" hidden>
+      <div class="summary" id="specialSummary">加载中…</div>
+      <div class="table-wrap">
+        <table id="specialTable">
+          <thead>
+            <tr>
+              <th>#</th>
+              <th>时间</th>
+              <th>用户</th>
+              <th>分类</th>
+              <th>平台/群</th>
+              <th>消息内容</th>
+              <th>特殊原因</th>
+              <th>操作</th>
+            </tr>
+          </thead>
+          <tbody id="specialTbody"></tbody>
+        </table>
+      </div>
+      <p class="empty" id="specialEmpty" hidden>暂无特殊记录。</p>
+    </section>
+
+    <!-- Tab: 超时记录 -->
+    <section id="pane-timeout" class="pane" hidden>
+      <div class="summary" id="timeoutSummary">加载中…</div>
+      <div class="table-wrap">
+        <table id="timeoutTable">
+          <thead>
+            <tr>
+              <th>#</th>
+              <th>原时间</th>
+              <th>归档时间</th>
+              <th>用户</th>
+              <th>平台/群</th>
+              <th>消息内容</th>
+              <th>判定原因</th>
+            </tr>
+          </thead>
+          <tbody id="timeoutTbody"></tbody>
+        </table>
+      </div>
+      <p class="empty" id="timeoutEmpty" hidden>暂无超时记录。</p>
     </section>
 
     <script type="module" src="./app.js"></script>
