@@ -1,14 +1,22 @@
 const bridge = window.AstrBotPluginPage;
 const tbody = document.getElementById("tbody");
 const logTbody = document.getElementById("logTbody");
+const specialTbody = document.getElementById("specialTbody");
+const timeoutTbody = document.getElementById("timeoutTbody");
 const summaryEl = document.getElementById("summary");
 const emptyEl = document.getElementById("empty");
 const logEmptyEl = document.getElementById("logEmpty");
+const specialEmptyEl = document.getElementById("specialEmpty");
+const specialSummaryEl = document.getElementById("specialSummary");
+const timeoutEmptyEl = document.getElementById("timeoutEmpty");
+const timeoutSummaryEl = document.getElementById("timeoutSummary");
 const refreshBtn = document.getElementById("refresh");
 const autoChk = document.getElementById("autoRefresh");
 const tabs = document.querySelectorAll(".tab");
 const paneStats = document.getElementById("pane-stats");
 const paneLogs = document.getElementById("pane-logs");
+const paneSpecial = document.getElementById("pane-special");
+const paneTimeout = document.getElementById("pane-timeout");
 
 let timer = null;
 let activeTab = "stats";
@@ -112,11 +120,12 @@ async function loadLogs() {
         const scope = r.is_private
           ? `${escapeHtml(r.platform || "-")} · 私聊`
           : `${escapeHtml(r.platform || "-")} · 群 ${escapeHtml(r.group_id || "-")}`;
+        const adminTag = r.is_admin ? ' <span class="badge admin">管理员</span>' : "";
         return `<tr>
           <td>${i + 1}</td>
           <td>${escapeHtml(r.time_str || "-")}</td>
           <td>
-            <div class="user">${escapeHtml(r.sender_name || r.user_id || "未知")}</div>
+            <div class="user">${escapeHtml(r.sender_name || r.user_id || "未知")}${adminTag}</div>
             <div class="uid">UID: ${escapeHtml(r.user_id || "-")}</div>
           </td>
           <td>${scope}</td>
@@ -135,11 +144,133 @@ async function loadLogs() {
   }
 }
 
+async function loadSpecial() {
+  try {
+    const res = await bridge.apiGet("special", { limit: 500 });
+    const data = res && res.data !== undefined ? res.data : res;
+    const items = data.items || [];
+    const byUser = data.by_user || {};
+
+    specialSummaryEl.innerHTML =
+      `共 <b>${data.total || 0}</b> 条特殊记录 · ` +
+      `涉及 <b>${Object.keys(byUser).length}</b> 人 · ` +
+      `（政治敏感/违法内容，按人分类归档以便举报）`;
+
+    if (items.length === 0) {
+      specialTbody.innerHTML = "";
+      specialEmptyEl.hidden = false;
+      return;
+    }
+    specialEmptyEl.hidden = true;
+
+    specialTbody.innerHTML = items
+      .map((r, i) => {
+        const scope = r.is_private
+          ? `${escapeHtml(r.platform || "-")} · 私聊`
+          : `${escapeHtml(r.platform || "-")} · 群 ${escapeHtml(r.group_id || "-")}`;
+        return `<tr>
+          <td>${i + 1}</td>
+          <td>${escapeHtml(r.time_str || "-")}</td>
+          <td>
+            <div class="user">${escapeHtml(r.sender_name || r.user_id || "未知")}</div>
+            <div class="uid">UID: ${escapeHtml(r.user_id || "-")}</div>
+          </td>
+          <td><span class="badge special">${escapeHtml(r.special_category || "未分类")}</span></td>
+          <td>${scope}</td>
+          <td class="msg" title="${escapeHtml(r.message)}">${escapeHtml(r.message || "-")}</td>
+          <td class="reason" title="${escapeHtml(r.special_reason)}">${escapeHtml(r.special_reason || "-")}</td>
+          <td>
+            <button class="btn small" data-msg="${escapeHtml(r.message || "")}">复制</button>
+          </td>
+        </tr>`;
+      })
+      .join("");
+
+    specialTbody.querySelectorAll("button").forEach((btn) => {
+      btn.addEventListener("click", () => {
+        navigator.clipboard?.writeText(btn.dataset.msg);
+        btn.textContent = "已复制";
+        setTimeout(() => (btn.textContent = "复制"), 1500);
+      });
+    });
+  } catch (e) {
+    if (activeTab === "special") {
+      specialSummaryEl.textContent = "加载失败：" + (e && e.message ? e.message : e);
+    }
+  }
+}
+
+async function loadTimeout() {
+  try {
+    const res = await bridge.apiGet("timeout", { limit: 500 });
+    const data = res && res.data !== undefined ? res.data : res;
+    const items = data.items || [];
+    const summaries = data.summaries || [];
+
+    timeoutSummaryEl.innerHTML =
+      `共 <b>${data.total || 0}</b> 条超时记录 · ` +
+      `<button id="clearTimeoutBtn" class="btn small danger">清理全部超时记录</button>`;
+
+    const clearBtn = document.getElementById("clearTimeoutBtn");
+    if (clearBtn) {
+      clearBtn.addEventListener("click", clearTimeoutArchive);
+    }
+
+    if (items.length === 0) {
+      timeoutTbody.innerHTML = "";
+      timeoutEmptyEl.hidden = false;
+      return;
+    }
+    timeoutEmptyEl.hidden = true;
+
+    timeoutTbody.innerHTML = items
+      .map((r, i) => {
+        const scope = r.is_private
+          ? `${escapeHtml(r.platform || "-")} · 私聊`
+          : `${escapeHtml(r.platform || "-")} · 群 ${escapeHtml(r.group_id || "-")}`;
+        const archivedStr = r.archived_at
+          ? escapeHtml(new Date(r.archived_at * 1000).toLocaleString())
+          : "-";
+        return `<tr>
+          <td>${i + 1}</td>
+          <td>${escapeHtml(r.time_str || "-")}</td>
+          <td>${archivedStr}</td>
+          <td>
+            <div class="user">${escapeHtml(r.sender_name || r.user_id || "未知")}</div>
+            <div class="uid">UID: ${escapeHtml(r.user_id || "-")}</div>
+          </td>
+          <td>${scope}</td>
+          <td class="msg" title="${escapeHtml(r.message)}">${escapeHtml(r.message || "-")}</td>
+          <td class="reason" title="${escapeHtml(r.reason)}">${escapeHtml(r.reason || "-")}</td>
+        </tr>`;
+      })
+      .join("");
+  } catch (e) {
+    if (activeTab === "timeout") {
+      timeoutSummaryEl.textContent = "加载失败：" + (e && e.message ? e.message : e);
+    }
+  }
+}
+
+async function clearTimeoutArchive() {
+  if (!confirm("确认清空全部超时记录？此操作不可撤销。")) return;
+  try {
+    await bridge.apiPost("timeout/clear", {});
+    await loadTimeout();
+  } catch (e) {
+    alert("清理失败：" + (e && e.message ? e.message : e));
+  }
+}
+
 async function load() {
   if (activeTab === "stats") {
     await loadStats();
-  } else {
+  } else if (activeTab === "logs") {
     await loadLogs();
+  } else if (activeTab === "special") {
+    await loadSpecial();
+  } else if (activeTab === "timeout") {
+    await loadTimeout();
   }
 }
 
@@ -158,14 +289,21 @@ async function resetUser(key, btn) {
 
 refreshBtn.addEventListener("click", load);
 
+const paneMap = {
+  stats: paneStats,
+  logs: paneLogs,
+  special: paneSpecial,
+  timeout: paneTimeout,
+};
+
 tabs.forEach((tab) => {
   tab.addEventListener("click", () => {
     tabs.forEach((t) => t.classList.remove("active"));
     tab.classList.add("active");
     activeTab = tab.dataset.tab;
-    const showLogs = activeTab === "logs";
-    paneStats.hidden = showLogs;
-    paneLogs.hidden = !showLogs;
+    Object.entries(paneMap).forEach(([name, pane]) => {
+      pane.hidden = name !== activeTab;
+    });
     load();
   });
 });
