@@ -1,5 +1,7 @@
 # astrbot_plugin_check_malicious_message 恶意消息检测
 
+**本插件由AI辅助完成，如有问题请前往[QQ交流群](https://qm.qq.com/q/2HuArULfbq)反馈**
+
 一个 [AstrBot](https://github.com/AstrBotDevs/AstrBot) 插件：调用大模型实时判断用户消息是否含有**严重恶意**（辱骂 / 人身攻击 / 骚扰 / 威胁 / 诈骗等），检测到时：
 
 - 以 **LLM 当前人格的语气**生成警告并发出；
