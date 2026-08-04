@@ -7,6 +7,15 @@ astrbot_plugin_check_malicious_message
   - 每 2 小时所有人的 x 自动 -1；
   - 通过插件页面实时展示每个人的 x 次数。
 
+v1.0.1 新增功能：
+  - 刷屏检测：单群单人连续发送多条消息时判断是否为无意义内容并决定是否警告；
+  - 防误判：首次判定为恶意时结合最近本群消息进行二次判定；
+  - 群管理员/群主豁免警告（但仍记录并增加 x）；
+  - 跨群禁言：用户在一个群被禁言后自动在其他群也禁言；
+  - 特殊记录页面：政治敏感/违法内容单独归档，按人分类以便举报；
+  - 超时记录页面：标准记录超过 7 天后归档至超时记录，可一键清理；
+  - 每日总结：自动归档超时记录并生成每日统计。
+
 依赖 AstrBot >= 4.5.7 的 LLM 调用接口（context.llm_generate / get_current_chat_provider_id）。
 """
 
@@ -15,7 +24,7 @@ import json
 import os
 import re
 import time
-from typing import Optional
+from typing import Any, Optional
 
 from astrbot.api import AstrBotConfig, logger
 from astrbot.api.event import AstrMessageEvent, MessageEventResult, filter
@@ -52,6 +61,10 @@ DEFAULT_WARN_MESSAGE = (
 
 DECAY_INTERVAL = 2 * 3600  # 每 2 小时衰减一次
 ROLE_CACHE_TTL = 600  # 机器人群角色缓存 10 分钟
+TARGET_ROLE_CACHE_TTL = 300  # 目标用户群角色缓存 5 分钟
+SPAM_TRACKER_MAX = 20  # 每用户每群保留的最近消息条数
+RECENT_MSG_MAX = 20  # 每用户每群保留的最近文本消息条数（防误判用）
+ARCHIVE_CHECK_INTERVAL = 6 * 3600  # 超时归档检查间隔（6 小时）
 DATA_FILENAME = "warning_data.json"
 
 
@@ -66,13 +79,30 @@ class CheckMaliciousMessagePlugin(Star):
         self._records: dict[str, dict] = {}
         # 备案日志: 每条记录被警告的消息内容与上下文
         self._logs: list[dict] = []
-        self._meta: dict = {"last_decrement": time.time()}
+        # 特殊记录: 政治敏感/违法内容，按人分类归档
+        self._special_records: list[dict] = []
+        # 超时记录: 标准备案记录超过 archive_timeout_days 后转移至此
+        self._timeout_archive: list[dict] = []
+        # 每日总结历史
+        self._daily_summaries: list[dict] = []
+        self._meta: dict = {
+            "last_decrement": time.time(),
+            "last_archive_check": 0.0,
+            "last_daily_summary": 0.0,
+        }
         # 用户级警告冷却记录: {key: 上次警告时间戳}
         self._cooldowns: dict[str, float] = {}
         # 机器人群角色缓存: {(platform_id, group_id): (role, expire_ts)}
         self._bot_role_cache: dict[tuple[str, str], tuple[str, float]] = {}
+        # 目标用户群角色缓存: {(platform_id, group_id, user_id): (role, expire_ts)}
+        self._target_role_cache: dict[tuple[str, str, str], tuple[str, float]] = {}
+        # 刷屏追踪: {(platform_id, group_id, user_id): [timestamps]}
+        self._spam_tracker: dict[tuple[str, str, str], list[float]] = {}
+        # 最近文本消息（防误判用）: {(platform_id, group_id, user_id): [str]}
+        self._recent_group_msgs: dict[tuple[str, str, str], list[str]] = {}
         self._data_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), DATA_FILENAME)
         self._decrement_task: Optional[asyncio.Task] = None
+        self._archive_task: Optional[asyncio.Task] = None
 
         self._load()
         self._apply_pending_decrements()
@@ -96,12 +126,30 @@ class CheckMaliciousMessagePlugin(Star):
             ["POST"],
             "重置某用户的警告次数",
         )
+        self.context.register_web_api(
+            f"/{PLUGIN_NAME}/special",
+            self._api_special,
+            ["GET"],
+            "获取特殊记录（政治敏感/违法内容）",
+        )
+        self.context.register_web_api(
+            f"/{PLUGIN_NAME}/timeout",
+            self._api_timeout,
+            ["GET"],
+            "获取超时记录",
+        )
+        self.context.register_web_api(
+            f"/{PLUGIN_NAME}/timeout/clear",
+            self._api_timeout_clear,
+            ["POST"],
+            "清理超时记录",
+        )
 
     # ------------------------------------------------------------------ 生命周期
 
     @filter.on_astrbot_loaded()
     async def _on_loaded(self):
-        """AstrBot 初始化完成后启动后台衰减任务。"""
+        """AstrBot 初始化完成后启动后台任务。"""
         if self._decrement_task is not None and not self._decrement_task.done():
             self._decrement_task.cancel()
             try:
@@ -109,6 +157,8 @@ class CheckMaliciousMessagePlugin(Star):
             except asyncio.CancelledError:
                 pass
         self._decrement_task = asyncio.create_task(self._decrement_loop())
+        if self._archive_task is None or self._archive_task.done():
+            self._archive_task = asyncio.create_task(self._archive_loop())
 
     async def terminate(self):
         """插件卸载 / 停用时调用。"""
@@ -116,6 +166,12 @@ class CheckMaliciousMessagePlugin(Star):
             self._decrement_task.cancel()
             try:
                 await self._decrement_task
+            except asyncio.CancelledError:
+                pass
+        if self._archive_task and not self._archive_task.done():
+            self._archive_task.cancel()
+            try:
+                await self._archive_task
             except asyncio.CancelledError:
                 pass
         self._save()
@@ -192,21 +248,66 @@ class CheckMaliciousMessagePlugin(Star):
             self._prune_cooldowns(now, cooldown)
             last = self._cooldowns.get(key)
             if last is not None and now - last < cooldown:
+                # 即使冷却中也要追踪消息用于刷屏/防误判
+                self._track_message(platform_id, group_id, sender_id, message_str, now)
                 return None
 
-        # 调用 LLM 判定
+        # 追踪消息（用于刷屏检测和防误判上下文）
+        self._track_message(platform_id, group_id, sender_id, message_str, now)
+
+        # ---- 刷屏检测 ----
+        if bool(cfg.get("enable_spam_detect", True)) and not is_private and group_id:
+            spam_result = await self._check_spam(
+                event, platform_id, group_id, sender_id, umo, now
+            )
+            if spam_result is not None:
+                return spam_result
+
+        # 调用 LLM 判定恶意
         malicious, reason = await self._detect(event, checked_str, umo)
         if not malicious:
             return None
 
-        # 命中恶意：累计 x
+        # ---- 防误判：二次判定 ----
+        if bool(cfg.get("enable_anti_false_positive", True)) and not is_private and group_id:
+            confirmed, reason = await self._rejudge_with_context(
+                event, checked_str, reason, umo, platform_id, group_id, sender_id
+            )
+            if not confirmed:
+                logger.info(f"[恶意消息检测] 防误判：二次判定未通过，放行 sender={sender_id}")
+                return None
+
+        # ---- 检查目标用户是否为群管理员/群主 ----
+        target_is_admin = False
+        if bool(cfg.get("exempt_admin_from_warn", True)) and not is_private and group_id:
+            if event.get_platform_name() == "aiocqhttp":
+                target_is_admin = await self._target_is_admin(
+                    event, platform_id, group_id, sender_id
+                )
+
+        # 命中恶意：累计 x（无论是否管理员都记录）
         rec = self._increment_count(event, reason, now)
         x = rec["count"]
 
         if cooldown > 0:
             self._cooldowns[key] = now
 
-        # 判断是否为“可禁言场景”：群聊 + aiocqhttp + enable_mute + 机器人为群管理员
+        # ---- 特殊记录检测（政治敏感/违法内容） ----
+        if bool(cfg.get("enable_special_record", True)):
+            asyncio.create_task(
+                self._detect_and_record_special(event, message_str, reason, umo, now)
+            )
+
+        # 管理员豁免：记录+x 但不警告不禁言
+        if target_is_admin:
+            logger.info(
+                f"[恶意消息检测] 目标为群管理员/群主，仅记录 x={x} sender={sender_id}"
+            )
+            self._record_log(event, message_str, reason, x, False, 0, now, is_admin=True)
+            self._save()
+            return None
+
+        # 判断是否为"可禁言场景"：群聊 + aiocqhttp + enable_mute + 机器人为群管理员
         mute_capable = False
         muted = False
         mute_minutes = 0
@@ -222,6 +323,11 @@ class CheckMaliciousMessagePlugin(Star):
             )
             if muted and mute_minutes > 0:
                 rec["last_muted_until"] = now + mute_minutes * 60
+                # ---- 跨群禁言 ----
+                if bool(cfg.get("enable_cross_group_mute", True)):
+                    asyncio.create_task(
+                        self._cross_group_mute(event, sender_id, group_id, platform_id, mute_minutes)
+                    )
 
         # 生成警告文案（以当前人格语气；可禁言场景会包含 x/禁言提示）
         warn_text = await self._generate_warning(
@@ -230,7 +336,7 @@ class CheckMaliciousMessagePlugin(Star):
         logger.info(
             f"[恶意消息检测] 命中恶意 sender={sender_id} x={x} umo={umo} "
             f"mute_capable={mute_capable} muted={muted}({mute_minutes}min) "
-            f"reason={reason} text={message_str[:60]!r}"
+            f"target_admin={target_is_admin} reason={reason} text={message_str[:60]!r}"
         )
 
         # 备案：保存被警告的消息内容与上下文
@@ -304,6 +410,254 @@ class CheckMaliciousMessagePlugin(Star):
             if bool(mal):
                 return True, str(reason) if reason else "模型判定为恶意"
         return False, ""
+
+    # ------------------------------------------------------------------ 消息追踪 / 刷屏检测
+
+    def _track_message(
+        self,
+        platform_id: str,
+        group_id: str,
+        sender_id: str,
+        message_str: str,
+        now: float,
+    ) -> None:
+        """追踪每条消息的时间戳和内容，用于刷屏检测和防误判。"""
+        if not group_id:
+            return
+        tk = (platform_id, group_id, sender_id)
+        # 追踪时间戳
+        ts_list = self._spam_tracker.setdefault(tk, [])
+        ts_list.append(now)
+        if len(ts_list) > SPAM_TRACKER_MAX:
+            self._spam_tracker[tk] = ts_list[-SPAM_TRACKER_MAX:]
+        # 追踪文本内容（防误判用）
+        msg_list = self._recent_group_msgs.setdefault(tk, [])
+        msg_list.append(message_str[:500])
+        if len(msg_list) > RECENT_MSG_MAX:
+            self._recent_group_msgs[tk] = msg_list[-RECENT_MSG_MAX:]
+
+    def _get_spam_count(
+        self, platform_id: str, group_id: str, sender_id: str, now: float, window: int
+    ) -> int:
+        """返回用户在指定时间窗口内发送的消息条数。"""
+        tk = (platform_id, group_id, sender_id)
+        ts_list = self._spam_tracker.get(tk, [])
+        cutoff = now - window
+        count = sum(1 for ts in ts_list if ts >= cutoff)
+        return count
+
+    def _get_recent_messages(
+        self, platform_id: str, group_id: str, sender_id: str, count: int
+    ) -> list[str]:
+        """返回用户最近在本群发送的若干条文本消息（用于防误判）。"""
+        tk = (platform_id, group_id, sender_id)
+        msg_list = self._recent_group_msgs.get(tk, [])
+        return msg_list[-count:] if count > 0 else []
+
+    async def _check_spam(
+        self,
+        event: AstrMessageEvent,
+        platform_id: str,
+        group_id: str,
+        sender_id: str,
+        umo: str,
+        now: float,
+    ) -> Optional[MessageEventResult]:
+        """刷屏检测：当用户在时间窗口内连续发送超过阈值条消息时，判断是否为无意义内容。"""
+        cfg = self.config
+        try:
+            threshold = int(cfg.get("spam_threshold", 3) or 3)
+        except (TypeError, ValueError):
+            threshold = 3
+        try:
+            window = int(cfg.get("spam_window", 10) or 10)
+        except (TypeError, ValueError):
+            window = 10
+
+        msg_count = self._get_spam_count(platform_id, group_id, sender_id, now, window)
+        if msg_count <= threshold:
+            return None
+
+        # 超过阈值，调用 LLM 判断是否为无意义刷屏
+        recent_msgs = self._get_recent_messages(platform_id, group_id, sender_id, msg_count)
+        is_spam, spam_reason = await self._detect_spam(event, recent_msgs, umo)
+        if not is_spam:
+            return None
+
+        logger.info(
+            f"[恶意消息检测] 刷屏检测命中 sender={sender_id} group={group_id} "
+            f"count={msg_count} reason={spam_reason}"
+        )
+
+        # 刷屏作为恶意处理：累计 x
+        reason = f"刷屏：{spam_reason}" if spam_reason else "刷屏"
+        rec = self._increment_count(event, reason, now)
+        x = rec["count"]
+
+        # 检查目标是否为管理员
+        target_is_admin = False
+        if bool(cfg.get("exempt_admin_from_warn", True)):
+            if event.get_platform_name() == "aiocqhttp":
+                target_is_admin = await self._target_is_admin(
+                    event, platform_id, group_id, sender_id
+                )
+
+        if target_is_admin:
+            self._record_log(event, "\n".join(recent_msgs[-5:]), reason, x, False, 0, now, is_admin=True)
+            self._save()
+            return None
+
+        # 尝试禁言
+        mute_capable = False
+        muted = False
+        mute_minutes = 0
+        self_id = event.get_self_id()
+        if bool(cfg.get("enable_mute", True)) and event.get_platform_name() == "aiocqhttp":
+            mute_capable = await self._bot_is_admin(event, platform_id, group_id, self_id)
+        if mute_capable:
+            muted, mute_minutes = await self._maybe_mute(
+                event, sender_id, group_id, platform_id, x
+            )
+            if muted and mute_minutes > 0:
+                rec["last_muted_until"] = now + mute_minutes * 60
+                if bool(cfg.get("enable_cross_group_mute", True)):
+                    asyncio.create_task(
+                        self._cross_group_mute(event, sender_id, group_id, platform_id, mute_minutes)
+                    )
+
+        warn_text = await self._generate_warning(
+            umo, rec, reason, x, mute_capable, muted, mute_minutes,
+            "\n".join(recent_msgs[-3:])
+        )
+        self._record_log(event, "\n".join(recent_msgs[-5:]), reason, x, muted, mute_minutes, now)
+        self._save()
+        return self._build_warn_result(event, sender_id, warn_text)
+
+    async def _detect_spam(
+        self, event: AstrMessageEvent, recent_msgs: list[str], umo: str
+    ) -> tuple[bool, str]:
+        """调用 LLM 判断连续消息是否为无意义刷屏。失败时 fail-open。"""
+        cfg = self.config
+        provider_id = (cfg.get("provider_id") or "").strip()
+        if not provider_id:
+            try:
+                provider_id = await self.context.get_current_chat_provider_id(umo=umo)
+            except Exception:
+                return False, ""
+
+        system_prompt = cfg.get("spam_prompt") or ""
+        if not system_prompt:
+            return False, ""
+
+        msgs_text = "\n".join(f"{i+1}. {m}" for i, m in enumerate(recent_msgs[-10:]))
+        user_prompt = f"以下是用户连续发送的消息，请判断是否属于无意义刷屏：\n\n{msgs_text}"
+        try:
+            resp = await self.context.llm_generate(
+                chat_provider_id=provider_id,
+                prompt=user_prompt,
+                system_prompt=system_prompt,
+            )
+        except Exception as e:
+            logger.warning(f"[恶意消息检测] 刷屏检测 LLM 调用失败，已放行: {e}")
+            return False, ""
+
+        text = getattr(resp, "completion_text", "") or ""
+        return self._parse_spam_detect(text)
+
+    @staticmethod
+    def _parse_spam_detect(text: str) -> tuple[bool, str]:
+        """解析刷屏检测结果。"""
+        raw = (text or "").strip()
+        if not raw:
+            return False, ""
+        candidate = raw
+        fence = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", candidate, re.DOTALL)
+        if fence:
+            candidate = fence.group(1)
+        else:
+            obj = re.search(r"\{[^{}]*\}", candidate, re.DOTALL)
+            if obj:
+                candidate = obj.group(0)
+        try:
+            data = json.loads(candidate)
+        except Exception:
+            low = raw.lower()
+            if '"spam"' in low and ('"spam": true' in low or '"spam":true' in low):
+                return True, "刷屏"
+            return False, ""
+        if isinstance(data, dict):
+            spam = data.get("spam")
+            reason = data.get("reason", "")
+            if isinstance(spam, str):
+                spam = spam.strip().lower() in ("true", "1", "yes", "y", "是")
+            if bool(spam):
+                return True, str(reason) if reason else "刷屏"
+        return False, ""
+
+    # ------------------------------------------------------------------ 防误判
+
+    async def _rejudge_with_context(
+        self,
+        event: AstrMessageEvent,
+        message_str: str,
+        first_reason: str,
+        umo: str,
+        platform_id: str,
+        group_id: str,
+        sender_id: str,
+    ) -> tuple[bool, str]:
+        """结合最近本群消息进行二次判定，降低误判率。
+
+        返回 (是否确认恶意, 原因)。
+        """
+        cfg = self.config
+        try:
+            ctx_count = int(cfg.get("anti_fp_context_count", 5) or 5)
+        except (TypeError, ValueError):
+            ctx_count = 5
+
+        recent_msgs = self._get_recent_messages(platform_id, group_id, sender_id, ctx_count)
+        # 移除最后一条（即当前正在判定的消息），避免重复
+        context_msgs = recent_msgs[:-1] if len(recent_msgs) > 1 else []
+
+        provider_id = (cfg.get("provider_id") or "").strip()
+        if not provider_id:
+            try:
+                provider_id = await self.context.get_current_chat_provider_id(umo=umo)
+            except Exception:
+                return True, first_reason  # 无法获取 Provider 时维持原判定
+
+        system_prompt = cfg.get("judge_prompt") or DEFAULT_JUDGE_PROMPT
+        context_text = "\n".join(
+            f"历史消息{i+1}: {m}" for i, m in enumerate(context_msgs)
+        ) if context_msgs else "（无历史消息）"
+
+        user_prompt = (
+            "首次判定认为以下消息含有严重恶意内容。请结合该用户在本群的最近消息上下文，"
+            "进行二次判定。如果结合上下文后发现并非真正恶意（如是在引用/讨论/反讽等），"
+            "请判定为非恶意。\n\n"
+            f"当前消息：\n{message_str}\n\n"
+            f"该用户最近在本群的消息：\n{context_text}\n\n"
+            "请只输出 JSON：\n"
+            '{"malicious": true, "reason": "确认恶意，简要原因"}\n'
+            "或\n"
+            '{"malicious": false, "reason": "非恶意原因"}'
+        )
+        try:
+            resp = await self.context.llm_generate(
+                chat_provider_id=provider_id,
+                prompt=user_prompt,
+                system_prompt=system_prompt,
+            )
+        except Exception as e:
+            logger.warning(f"[恶意消息检测] 防误判 LLM 调用失败，维持原判定: {e}")
+            return True, first_reason
+
+        text = getattr(resp, "completion_text", "") or ""
+        confirmed, reason = self._parse_detect(text)
+        if confirmed:
+            return True, reason or first_reason
+        return False, reason
 
     # ------------------------------------------------------------------ 警告生成（人格）
 
@@ -562,7 +916,253 @@ class CheckMaliciousMessagePlugin(Star):
             logger.warning(f"[恶意消息检测] 查询机器人群角色失败，按非管理员处理: {e}")
             return False
 
-    # ------------------------------------------------------------------ 计数与衰减
+    async def _target_is_admin(
+        self,
+        event: AstrMessageEvent,
+        platform_id: str,
+        group_id: str,
+        user_id: str,
+    ) -> bool:
+        """查询目标用户在指定群是否为管理员/群主。结果缓存 5 分钟。"""
+        cache_key = (platform_id, group_id, user_id)
+        now = time.time()
+        cached = self._target_role_cache.get(cache_key)
+        if cached and cached[1] > now:
+            return cached[0] in ("admin", "owner")
+        try:
+            client = event.bot
+            gid = int(group_id)
+            uid = int(user_id)
+            info = await client.api.call_action(
+                "get_group_member_info", group_id=gid, user_id=uid
+            )
+            role = ""
+            if isinstance(info, dict):
+                role = str(info.get("role", "")).lower()
+            self._target_role_cache[cache_key] = (role, now + TARGET_ROLE_CACHE_TTL)
+            return role in ("admin", "owner")
+        except Exception as e:
+            logger.warning(f"[恶意消息检测] 查询目标群角色失败，按非管理员处理: {e}")
+            return False
+
+    async def _cross_group_mute(
+        self,
+        event: AstrMessageEvent,
+        sender_id: str,
+        source_group_id: str,
+        platform_id: str,
+        mute_minutes: int,
+    ) -> None:
+        """当用户在一个群被禁言后，自动在其他群也禁言。
+
+        检查顺序（每个群）：
+        1. 机器人是否为该群管理员
+        2. 目标用户是否在该群（尝试查询群成员信息）
+        3. 目标用户是否非该群管理员（管理员不禁言）
+        满足全部条件则执行禁言。
+        """
+        try:
+            duration = min(mute_minutes * 60, 2592000)
+            uid = int(sender_id)
+        except (TypeError, ValueError):
+            logger.warning(f"[恶意消息检测] 跨群禁言：uid 转换失败: {sender_id}")
+            return
+
+        client = event.bot
+        # 获取机器人加入的所有群
+        try:
+            group_list = await client.api.call_action("get_group_list")
+        except Exception as e:
+            logger.warning(f"[恶意消息检测] 跨群禁言：获取群列表失败: {e}")
+            return
+
+        if not isinstance(group_list, list):
+            return
+
+        self_id = event.get_self_id()
+        for g in group_list:
+            if not isinstance(g, dict):
+                continue
+            gid_str = str(g.get("group_id", ""))
+            if not gid_str or gid_str == str(source_group_id):
+                continue  # 跳过源群
+
+            gid = 0
+            try:
+                gid = int(gid_str)
+            except (TypeError, ValueError):
+                continue
+
+            # 1. 机器人是否为该群管理员
+            bot_admin = await self._bot_is_admin_in_group(client, platform_id, gid_str, self_id)
+            if not bot_admin:
+                continue
+
+            # 2. 目标用户是否在该群
+            in_group = await self._user_in_group(client, gid, uid)
+            if not in_group:
+                continue
+
+            # 3. 目标用户是否非该群管理员
+            target_admin = await self._target_is_admin_in_group(client, gid, uid)
+            if target_admin:
+                continue
+
+            try:
+                await client.api.call_action(
+                    "set_group_ban",
+                    group_id=gid,
+                    user_id=uid,
+                    duration=duration,
+                )
+                logger.info(
+                    f"[恶意消息检测] 跨群禁言成功 uid={uid} gid={gid} {mute_minutes} 分钟"
+                )
+            except Exception as e:
+                logger.debug(f"[恶意消息检测] 跨群禁言失败 gid={gid}: {e}")
+
+    async def _bot_is_admin_in_group(
+        self, client: Any, platform_id: str, group_id: str, self_id: str
+    ) -> bool:
+        """查询机器人在指定群是否为管理员（跨群禁言用）。"""
+        cache_key = (platform_id, group_id)
+        now = time.time()
+        cached = self._bot_role_cache.get(cache_key)
+        if cached and cached[1] > now:
+            return cached[0] in ("admin", "owner")
+        try:
+            sid = int(self_id) if self_id else 0
+            gid = int(group_id)
+            if not sid:
+                return False
+            info = await client.api.call_action(
+                "get_group_member_info", group_id=gid, user_id=sid
+            )
+            role = ""
+            if isinstance(info, dict):
+                role = str(info.get("role", "")).lower()
+            self._bot_role_cache[cache_key] = (role, now + ROLE_CACHE_TTL)
+            return role in ("admin", "owner")
+        except Exception:
+            return False
+
+    async def _user_in_group(self, client: Any, gid: int, uid: int) -> bool:
+        """检查用户是否在指定群中。"""
+        try:
+            await client.api.call_action(
+                "get_group_member_info", group_id=gid, user_id=uid
+            )
+            return True
+        except Exception:
+            return False
+
+    async def _target_is_admin_in_group(self, client: Any, gid: int, uid: int) -> bool:
+        """查询目标用户在指定群是否为管理员（跨群禁言用，无缓存）。"""
+        try:
+            info = await client.api.call_action(
+                "get_group_member_info", group_id=gid, user_id=uid
+            )
+            role = ""
+            if isinstance(info, dict):
+                role = str(info.get("role", "")).lower()
+            return role in ("admin", "owner")
+        except Exception:
+            return False
+
+    # ------------------------------------------------------------------ 特殊记录
+
+    async def _detect_and_record_special(
+        self,
+        event: AstrMessageEvent,
+        message_str: str,
+        reason: str,
+        umo: str,
+        now: float,
+    ) -> None:
+        """检测消息是否涉及政治敏感/违法内容，若是则记录到特殊记录。"""
+        cfg = self.config
+        provider_id = (cfg.get("provider_id") or "").strip()
+        if not provider_id:
+            try:
+                provider_id = await self.context.get_current_chat_provider_id(umo=umo)
+            except Exception:
+                return
+
+        system_prompt = cfg.get("special_record_prompt") or ""
+        if not system_prompt:
+            return
+
+        user_prompt = f"请判断以下消息是否可能涉及政治敏感或违法内容：\n\n{message_str[:500]}"
+        try:
+            resp = await self.context.llm_generate(
+                chat_provider_id=provider_id,
+                prompt=user_prompt,
+                system_prompt=system_prompt,
+            )
+        except Exception as e:
+            logger.warning(f"[恶意消息检测] 特殊记录检测 LLM 调用失败: {e}")
+            return
+
+        text = getattr(resp, "completion_text", "") or ""
+        special, category, sp_reason = self._parse_special_detect(text)
+        if not special:
+            return
+
+        entry = {
+            "time": now,
+            "time_str": self._fmt_ts(now),
+            "user_id": event.get_sender_id(),
+            "sender_name": event.get_sender_name(),
+            "platform": event.get_platform_name(),
+            "platform_id": event.get_platform_id(),
+            "group_id": event.get_group_id(),
+            "is_private": event.is_private_chat(),
+            "message": message_str[:500],
+            "reason": reason,
+            "special_category": category,
+            "special_reason": sp_reason,
+            "archived": False,
+        }
+        self._special_records.append(entry)
+        # 保留最近 1000 条特殊记录
+        if len(self._special_records) > 1000:
+            self._special_records = self._special_records[-1000:]
+        self._save()
+        logger.info(
+            f"[恶意消息检测] 特殊记录 sender={event.get_sender_id()} "
+            f"category={category} reason={sp_reason}"
+        )
+
+    @staticmethod
+    def _parse_special_detect(text: str) -> tuple[bool, str, str]:
+        """解析特殊记录检测结果。返回 (是否特殊, 分类, 原因)。"""
+        raw = (text or "").strip()
+        if not raw:
+            return False, "", ""
+        candidate = raw
+        fence = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", candidate, re.DOTALL)
+        if fence:
+            candidate = fence.group(1)
+        else:
+            obj = re.search(r"\{.*\}", candidate, re.DOTALL)
+            if obj:
+                candidate = obj.group(0)
+        try:
+            data = json.loads(candidate)
+        except Exception:
+            low = raw.lower()
+            if '"special"' in low and ('"special": true' in low or '"special":true' in low):
+                return True, "其他", "模型判定为特殊内容"
+            return False, "", ""
+        if isinstance(data, dict):
+            special = data.get("special")
+            category = data.get("category", "")
+            reason = data.get("reason", "")
+            if isinstance(special, str):
+                special = special.strip().lower() in ("true", "1", "yes", "y", "是")
+            if bool(special):
+                return True, str(category) or "其他", str(reason)
+        return False, "", ""
 
     def _record_key(self, platform_id: str, sender_id: str) -> str:
         return f"{platform_id}:{sender_id}"
@@ -604,6 +1204,7 @@ class CheckMaliciousMessagePlugin(Star):
         muted: bool,
         mute_minutes: int,
         now: float,
+        is_admin: bool = False,
     ) -> None:
         """备案：保存被警告的消息内容与上下文（仅保留最近 500 条）。"""
         entry = {
@@ -620,6 +1221,7 @@ class CheckMaliciousMessagePlugin(Star):
             "count": x,
             "muted": muted,
             "mute_minutes": mute_minutes,
+            "is_admin": is_admin,
         }
         self._logs.append(entry)
         # 仅保留最近 500 条，防止无限增长
@@ -687,6 +1289,100 @@ class CheckMaliciousMessagePlugin(Star):
         logger.info(f"[恶意消息检测] 补算停机期间衰减 {intervals} 次")
         self._save()
 
+    # ------------------------------------------------------------------ 超时归档 / 每日总结
+
+    async def _archive_loop(self):
+        """每 6 小时检查一次是否有标准备案记录超过 archive_timeout_days 天，需要归档。"""
+        await asyncio.sleep(10)
+        while True:
+            try:
+                if bool(self.config.get("enable_daily_summary", True)):
+                    self._archive_old_records()
+                    self._do_daily_summary_if_needed()
+                # 每 6 小时检查一次
+                await asyncio.sleep(ARCHIVE_CHECK_INTERVAL)
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                logger.warning(f"[恶意消息检测] 归档任务异常: {e}")
+                await asyncio.sleep(3600)
+
+    def _archive_old_records(self):
+        """将超过 archive_timeout_days 天的标准备案记录转移到超时记录。特殊记录不受影响。"""
+        try:
+            timeout_days = int(self.config.get("archive_timeout_days", 7) or 7)
+        except (TypeError, ValueError):
+            timeout_days = 7
+        cutoff = time.time() - timeout_days * 86400
+
+        new_logs = []
+        archived = []
+        for entry in self._logs:
+            if entry.get("time", 0) < cutoff:
+                entry["archived_at"] = time.time()
+                archived.append(entry)
+            else:
+                new_logs.append(entry)
+
+        if archived:
+            self._logs = new_logs
+            self._timeout_archive.extend(archived)
+            # 保留最近 2000 条超时记录
+            if len(self._timeout_archive) > 2000:
+                self._timeout_archive = self._timeout_archive[-2000:]
+            self._meta["last_archive_check"] = time.time()
+            self._save()
+            logger.info(f"[恶意消息检测] 已归档 {len(archived)} 条超时备案记录")
+
+    def _do_daily_summary_if_needed(self):
+        """如果距上次每日总结超过 24 小时，执行一次。"""
+        now = time.time()
+        last = float(self._meta.get("last_daily_summary", 0) or 0)
+        if now - last < 86400:  # 24 小时
+            return
+
+        # 统计当日数据
+        day_start = now - 86400
+        today_logs = [l for l in self._logs if l.get("time", 0) >= day_start]
+        today_special = [s for s in self._special_records if s.get("time", 0) >= day_start]
+
+        total_warned = len(set(l.get("user_id") for l in today_logs if l.get("user_id")))
+        total_muted = sum(1 for l in today_logs if l.get("muted"))
+        total_special = len(today_special)
+
+        summary = {
+            "time": now,
+            "time_str": self._fmt_ts(now),
+            "date": self._fmt_date(now),
+            "total_warnings": len(today_logs),
+            "total_warned_users": total_warned,
+            "total_muted": total_muted,
+            "total_special": total_special,
+            "top_users": sorted(
+                [
+                    {
+                        "user_id": l.get("user_id"),
+                        "sender_name": l.get("sender_name"),
+                        "count": sum(
+                            1 for x in today_logs if x.get("user_id") == l.get("user_id")
+                        ),
+                    }
+                    for l in today_logs
+                ],
+                key=lambda x: x["count"],
+                reverse=True,
+            )[:10],
+        }
+        self._daily_summaries.append(summary)
+        if len(self._daily_summaries) > 365:
+            self._daily_summaries = self._daily_summaries[-365:]
+        self._meta["last_daily_summary"] = now
+        self._save()
+        logger.info(
+            f"[恶意消息检测] 每日总结: 警告 {summary['total_warnings']} 次, "
+            f"涉及 {total_warned} 人, 禁言 {total_muted} 次, 特殊记录 {total_special} 条"
+        )
+
     # ------------------------------------------------------------------ 持久化
 
     def _load(self):
@@ -696,18 +1392,35 @@ class CheckMaliciousMessagePlugin(Star):
                     data = json.load(f)
                 self._records = data.get("records", {}) or {}
                 self._logs = data.get("logs", []) or []
+                self._special_records = data.get("special_records", []) or []
+                self._timeout_archive = data.get("timeout_archive", []) or []
+                self._daily_summaries = data.get("daily_summaries", []) or []
                 self._meta = data.get("meta", {}) or {}
                 if "last_decrement" not in self._meta:
                     self._meta["last_decrement"] = time.time()
+                if "last_archive_check" not in self._meta:
+                    self._meta["last_archive_check"] = 0.0
+                if "last_daily_summary" not in self._meta:
+                    self._meta["last_daily_summary"] = 0.0
         except Exception as e:
             logger.warning(f"[恶意消息检测] 加载持久化数据失败，使用空数据: {e}")
             self._records = {}
             self._logs = []
-            self._meta = {"last_decrement": time.time()}
+            self._special_records = []
+            self._timeout_archive = []
+            self._daily_summaries = []
+            self._meta = {"last_decrement": time.time(), "last_archive_check": 0.0, "last_daily_summary": 0.0}
 
     def _save(self):
         try:
-            data = {"records": self._records, "logs": self._logs, "meta": self._meta}
+            data = {
+                "records": self._records,
+                "logs": self._logs,
+                "special_records": self._special_records,
+                "timeout_archive": self._timeout_archive,
+                "daily_summaries": self._daily_summaries,
+                "meta": self._meta,
+            }
             tmp = self._data_path + ".tmp"
             with open(tmp, "w", encoding="utf-8") as f:
                 json.dump(data, f, ensure_ascii=False, indent=2)
@@ -819,6 +1532,40 @@ class CheckMaliciousMessagePlugin(Star):
         self._save()
         return json_response({"ok": True, "key": key})
 
+    async def _api_special(self):
+        """返回特殊记录（政治敏感/违法内容），按人分类。"""
+        limit = request.query.get("limit", 500, type=int) or 500
+        items = list(reversed(self._special_records))[:limit]
+        # 按用户分组
+        by_user: dict[str, list] = {}
+        for item in items:
+            uid = str(item.get("user_id", ""))
+            by_user.setdefault(uid, []).append(item)
+        return json_response({
+            "total": len(self._special_records),
+            "items": items,
+            "by_user": by_user,
+        })
+
+    async def _api_timeout(self):
+        """返回超时记录与每日总结。"""
+        limit = request.query.get("limit", 500, type=int) or 500
+        items = list(reversed(self._timeout_archive))[:limit]
+        summaries = list(reversed(self._daily_summaries))[:30]
+        return json_response({
+            "total": len(self._timeout_archive),
+            "items": items,
+            "summaries": summaries,
+        })
+
+    async def _api_timeout_clear(self):
+        """清空超时记录。"""
+        count = len(self._timeout_archive)
+        self._timeout_archive = []
+        self._save()
+        logger.info(f"[恶意消息检测] 已清理 {count} 条超时记录")
+        return json_response({"ok": True, "cleared": count})
+
     def _next_decay_seconds(self) -> int:
         last = float(self._meta.get("last_decrement", 0) or 0)
         if last <= 0:
@@ -834,6 +1581,17 @@ class CheckMaliciousMessagePlugin(Star):
             import datetime as _dt
 
             return _dt.datetime.fromtimestamp(int(ts)).strftime("%Y-%m-%d %H:%M:%S")
+        except Exception:
+            return str(ts)
+
+    @staticmethod
+    def _fmt_date(ts: float) -> str:
+        if not ts:
+            return "-"
+        try:
+            import datetime as _dt
+
+            return _dt.datetime.fromtimestamp(int(ts)).strftime("%Y-%m-%d")
         except Exception:
             return str(ts)
 
