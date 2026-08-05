@@ -31,13 +31,15 @@ from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
-__VERSION__ = "1.3.1"
+__VERSION__ = "1.4.0"
 CONFIG_PATH_DEFAULT = "config.json"
 RECORDS_FILE = "records.json"
 SPECIAL_FILE = "special_records.json"
+LOGS_FILE = "logs.json"
 AUDIT_LOG = "audit.log.jsonl"
 REQUEST_LOG = "request.log.jsonl"
 WEB_DIR = "web"
+MAX_LOGS = 50000  # 备案日志容量上限（FIFO 截断）
 
 # ---------------------------------------------------------------------------
 # 全局状态（受 LOCK 保护）
@@ -47,6 +49,8 @@ LOCK = threading.RLock()
 CONFIG: dict = {}
 RECORDS: dict[str, dict] = {}
 SPECIAL_RECORDS: list[dict] = []
+LOGS: list[dict] = []            # 备案日志（个体警告事件，由客户端上传）
+LOGS_INDEX: set[str] = set()     # log_id 去重索引，启动时重建
 META: dict = {"created_at": 0, "last_seq": 0}
 DATA_DIR = "data"
 LOG_DIR = "logs"
@@ -203,8 +207,12 @@ def special_path() -> str:
     return os.path.join(DATA_DIR, SPECIAL_FILE)
 
 
+def logs_path() -> str:
+    return os.path.join(DATA_DIR, LOGS_FILE)
+
+
 def load_data() -> None:
-    global RECORDS, SPECIAL_RECORDS, META
+    global RECORDS, SPECIAL_RECORDS, LOGS, LOGS_INDEX, META
     try:
         if os.path.exists(records_path()):
             with open(records_path(), "r", encoding="utf-8") as f:
@@ -232,6 +240,20 @@ def load_data() -> None:
         sys.stderr.write(f"[load special] 失败: {e}\n")
         SPECIAL_RECORDS = []
 
+    try:
+        if os.path.exists(logs_path()):
+            with open(logs_path(), "r", encoding="utf-8") as f:
+                d = json.load(f)
+            LOGS = d.get("logs", []) or []
+        else:
+            LOGS = []
+        # 重建 log_id 去重索引
+        LOGS_INDEX = {str(l.get("log_id", "")) for l in LOGS if l.get("log_id")}
+    except Exception as e:
+        sys.stderr.write(f"[load logs] 失败: {e}\n")
+        LOGS = []
+        LOGS_INDEX = set()
+
 
 def save_records() -> None:
     os.makedirs(DATA_DIR, exist_ok=True)
@@ -243,6 +265,21 @@ def save_special() -> None:
     os.makedirs(DATA_DIR, exist_ok=True)
     data = {"special_records": SPECIAL_RECORDS, "meta": {"updated_at": now_ts()}}
     atomic_write(special_path(), data)
+
+
+def save_logs() -> None:
+    os.makedirs(DATA_DIR, exist_ok=True)
+    data = {"logs": LOGS, "meta": {"updated_at": now_ts()}}
+    atomic_write(logs_path(), data)
+
+
+def trim_logs() -> None:
+    """FIFO 截断备案日志到 MAX_LOGS，同步更新索引。"""
+    global LOGS_INDEX
+    if len(LOGS) <= MAX_LOGS:
+        return
+    LOGS[:] = LOGS[-MAX_LOGS:]
+    LOGS_INDEX = {str(l.get("log_id", "")) for l in LOGS if l.get("log_id")}
 
 
 # ---- IP 黑名单 ----
@@ -331,6 +368,7 @@ def merge_record(key: str, incoming: dict, bot_id: str) -> dict:
             "updated_at": ts,
             "created_at": ts,
             "sources": [],
+            "admin_rev": 0,   # 管理员修订版本号：admin 改动 +1，强制下发覆盖客户端
         }
         RECORDS[key] = cur
 
@@ -662,6 +700,12 @@ class Handler(BaseHTTPRequestHandler):
                     log_request("GET", path, 401, self.client_address[0])
                     return self._send_error_json(HTTPStatus.UNAUTHORIZED, "invalid token")
                 return self._handle_list_special(qs)
+            if path == "/api/logs":
+                # 备案日志：admin 和 client 都可读（详情弹窗数据源）
+                if not self._check_any_token():
+                    log_request("GET", path, 401, self.client_address[0])
+                    return self._send_error_json(HTTPStatus.UNAUTHORIZED, "invalid token")
+                return self._handle_list_logs(qs)
             if path == "/api/sync":
                 if not self._check_client_token():
                     log_request("GET", path, 401, self.client_address[0])
@@ -711,6 +755,12 @@ class Handler(BaseHTTPRequestHandler):
                     log_request("POST", path, 401, self.client_address[0])
                     return self._send_error_json(HTTPStatus.UNAUTHORIZED, "invalid client token")
                 return self._handle_upload_special()
+            if path == "/api/upload_logs":
+                # 客户端推送备案日志
+                if not self._check_client_token():
+                    log_request("POST", path, 401, self.client_address[0])
+                    return self._send_error_json(HTTPStatus.UNAUTHORIZED, "invalid client token")
+                return self._handle_upload_logs()
             if path == "/api/sync":
                 if not self._check_client_token():
                     log_request("POST", path, 401, self.client_address[0])
@@ -721,12 +771,24 @@ class Handler(BaseHTTPRequestHandler):
                     log_request("POST", path, 401, self.client_address[0])
                     return self._send_error_json(HTTPStatus.UNAUTHORIZED, "invalid admin token")
                 return self._handle_delete_record()
+            if path == "/api/zero_count":
+                # 管理员清零（强制下发）
+                if not self._check_admin_token():
+                    log_request("POST", path, 401, self.client_address[0])
+                    return self._send_error_json(HTTPStatus.UNAUTHORIZED, "invalid admin token")
+                return self._handle_zero_count()
             if path == "/api/revoke_record":
                 # 误判撤回：client_token 鉴权 + bot_id 一致性校验
                 if not self._check_client_token():
                     log_request("POST", path, 401, self.client_address[0])
                     return self._send_error_json(HTTPStatus.UNAUTHORIZED, "invalid client token")
                 return self._handle_revoke_record()
+            if path == "/api/decay":
+                # 合法衰减：admin_token 或 client_token 均可（鉴权在 handler 内细分）
+                if not (self._check_admin_token() or self._check_client_token()):
+                    log_request("POST", path, 401, self.client_address[0])
+                    return self._send_error_json(HTTPStatus.UNAUTHORIZED, "invalid token")
+                return self._handle_decay()
             if path == "/api/dedup":
                 # 手动去重：仅 admin_token
                 if not self._check_admin_token():
@@ -745,6 +807,12 @@ class Handler(BaseHTTPRequestHandler):
                     log_request("POST", path, 401, self.client_address[0])
                     return self._send_error_json(HTTPStatus.UNAUTHORIZED, "invalid admin token")
                 return self._handle_blacklist_remove()
+            if path == "/api/delete_old_logs":
+                # 管理员删除存放超过 N 天的备案日志
+                if not self._check_admin_token():
+                    log_request("POST", path, 401, self.client_address[0])
+                    return self._send_error_json(HTTPStatus.UNAUTHORIZED, "invalid admin token")
+                return self._handle_delete_old_logs()
             log_request("POST", path, 404, self.client_address[0])
             return self._send_error_json(HTTPStatus.NOT_FOUND, "not found")
         except Exception as e:
@@ -777,6 +845,7 @@ class Handler(BaseHTTPRequestHandler):
                 "ok": True,
                 "records": len(RECORDS),
                 "special_records": len(SPECIAL_RECORDS),
+                "logs": len(LOGS),
                 "muted_users": muted,
                 "high_risk_users": high,
                 "bots_contributed": len(bots),
@@ -1097,6 +1166,205 @@ class Handler(BaseHTTPRequestHandler):
             "record_key": record_key,
             "old_count": old_count,
             "new_count": new_count,
+        })
+
+    def _handle_decay(self):
+        """合法衰减：批量将指定 key 的 count -1。
+
+        鉴权：admin_token → 全局衰减权（跳过 sources 校验）；
+              client_token → 强制校验 bot_id 在 record.sources 中（仅能衰减本 bot 上传的数据）。
+        body: {"bot_id": "...", "keys": ["k1", "k2", ...]}
+        """
+        body, err = self._read_body()
+        if err:
+            log_request("POST", "/api/decay", 400, self.client_address[0], err)
+            return self._send_error_json(HTTPStatus.BAD_REQUEST, f"invalid body: {err}")
+        bot_id = str(body.get("bot_id", "")) or ""
+        keys = body.get("keys") or []
+        if isinstance(keys, str):
+            keys = [keys]
+        if not isinstance(keys, list) or not keys:
+            return self._send_error_json(HTTPStatus.BAD_REQUEST, "missing keys")
+        is_admin = self._check_admin_token()
+        decayed = []
+        denied = []
+        not_found = []
+        ts = now_ts()
+        with LOCK:
+            for k in keys:
+                rec = RECORDS.get(k)
+                if rec is None:
+                    not_found.append(k)
+                    continue
+                # 鉴权：非 admin 时校验 bot_id 在 sources 中
+                if not is_admin:
+                    sources = rec.get("sources") or []
+                    if bot_id not in sources:
+                        denied.append(k)
+                        audit_log("decay_denied", bot_id, {
+                            "record_key": k, "reason": "bot_id not in sources", "sources": sources,
+                        })
+                        continue
+                old_count = int(rec.get("count", 0) or 0)
+                new_count = max(0, old_count - 1)
+                rec["count"] = new_count
+                rec["updated_by"] = bot_id if not is_admin else "admin"
+                rec["updated_at"] = ts
+                rec["seq"] = next_seq()
+                decayed.append({"key": k, "old_count": old_count, "new_count": new_count})
+            if decayed:
+                save_records()
+        audit_log("decay", bot_id if not is_admin else "admin", {
+            "decayed": len(decayed), "denied": len(denied), "not_found": len(not_found),
+        })
+        log_request("POST", "/api/decay", 200, self.client_address[0],
+                    f"decayed={len(decayed)}, denied={len(denied)}, not_found={len(not_found)}")
+        return self._send_json(HTTPStatus.OK, {
+            "ok": True, "decayed": decayed, "denied": denied, "not_found": not_found,
+        })
+
+    def _handle_upload_logs(self):
+        """客户端推送备案日志（个体警告事件）。按 log_id 去重。
+        body: {"bot_id": "...", "logs": [{...}, ...]}
+        """
+        body, err = self._read_body()
+        if err:
+            log_request("POST", "/api/upload_logs", 400, self.client_address[0], err)
+            return self._send_error_json(HTTPStatus.BAD_REQUEST, f"invalid body: {err}")
+        bot_id = str(body.get("bot_id", "anonymous")) or "anonymous"
+        logs = body.get("logs") or []
+        if not isinstance(logs, list):
+            return self._send_error_json(HTTPStatus.BAD_REQUEST, "logs must be a list")
+        uploaded = 0
+        skipped = 0
+        ts = now_ts()
+        with LOCK:
+            for item in logs:
+                if not isinstance(item, dict):
+                    skipped += 1
+                    continue
+                lid = str(item.get("log_id", ""))
+                if not lid:
+                    skipped += 1
+                    continue
+                if lid in LOGS_INDEX:
+                    skipped += 1
+                    continue
+                item["cloud_bot_id"] = bot_id
+                item["cloud_seq"] = next_seq()
+                item["cloud_uploaded_at"] = ts
+                LOGS.append(item)
+                LOGS_INDEX.add(lid)
+                uploaded += 1
+            trim_logs()
+            if uploaded > 0:
+                save_logs()
+        audit_log("upload_logs", bot_id, {"uploaded": uploaded, "skipped": skipped})
+        log_request("POST", "/api/upload_logs", 200, self.client_address[0],
+                    f"uploaded={uploaded}, skipped={skipped}")
+        return self._send_json(HTTPStatus.OK, {
+            "ok": True, "uploaded": uploaded, "skipped": skipped, "total_cloud": len(LOGS),
+        })
+
+    def _handle_list_logs(self, qs):
+        """列出备案日志，支持按 user_id/platform_id 过滤。"""
+        try:
+            limit = int(qs.get("limit", ["200"])[0] or 200)
+        except ValueError:
+            limit = 200
+        try:
+            offset = int(qs.get("offset", ["0"])[0] or 0)
+        except ValueError:
+            offset = 0
+        limit = max(1, min(limit, 1000))
+        offset = max(0, offset)
+        uid = (qs.get("user_id", [""])[0] or "").strip()
+        pid = (qs.get("platform_id", [""])[0] or "").strip()
+        with LOCK:
+            items = list(LOGS)
+        # 倒序（最新在前）
+        items.reverse()
+        if uid:
+            items = [l for l in items if str(l.get("user_id", "")) == uid]
+        if pid:
+            items = [l for l in items if str(l.get("platform_id", "")) == pid]
+        total = len(items)
+        items = items[offset: offset + limit]
+        log_request("GET", "/api/logs", 200, self.client_address[0],
+                    f"uid={uid}, pid={pid}, total={total}")
+        return self._send_json(HTTPStatus.OK, {"total": total, "items": items})
+
+    def _handle_zero_count(self):
+        """管理员清零：将指定 key 的 count 设为 0 并 bump admin_rev（强制下发）。
+        body: {"keys": ["k1", ...]} 或 {"key": "k1"}
+        """
+        body, err = self._read_body()
+        if err:
+            log_request("POST", "/api/zero_count", 400, self.client_address[0], err)
+            return self._send_error_json(HTTPStatus.BAD_REQUEST, f"invalid body: {err}")
+        keys = body.get("keys") or []
+        if isinstance(keys, str):
+            keys = [keys]
+        if not isinstance(keys, list) or not keys:
+            single = body.get("key")
+            if single:
+                keys = [single]
+            else:
+                return self._send_error_json(HTTPStatus.BAD_REQUEST, "missing keys/key")
+        zeroed = []
+        skipped = 0
+        ts = now_ts()
+        with LOCK:
+            for k in keys:
+                rec = RECORDS.get(k)
+                if rec is None:
+                    skipped += 1
+                    continue
+                old_count = int(rec.get("count", 0) or 0)
+                rec["count"] = 0
+                rec["admin_rev"] = int(rec.get("admin_rev", 0) or 0) + 1
+                rec["updated_by"] = "admin"
+                rec["updated_at"] = ts
+                rec["seq"] = next_seq()
+                zeroed.append({"key": k, "old_count": old_count})
+            if zeroed:
+                save_records()
+        audit_log("zero_count", "admin", {"zeroed": zeroed, "skipped": skipped})
+        log_request("POST", "/api/zero_count", 200, self.client_address[0],
+                    f"zeroed={len(zeroed)}, skipped={skipped}")
+        return self._send_json(HTTPStatus.OK, {
+            "ok": True, "zeroed": zeroed, "skipped": skipped,
+        })
+
+    def _handle_delete_old_logs(self):
+        """管理员删除存放超过指定天数的备案日志。
+        body 可选: {"days": 7}（默认 7）
+        """
+        global LOGS_INDEX
+        body, err = self._read_body()
+        if err:
+            # 允许空 body
+            body = {}
+        try:
+            days = int((body or {}).get("days", 7) or 7)
+        except (TypeError, ValueError):
+            days = 7
+        days = max(1, days)
+        cutoff = now_ts() - days * 86400
+        with LOCK:
+            old_len = len(LOGS)
+            kept = [l for l in LOGS if float(l.get("time", 0) or 0) >= cutoff]
+            removed = old_len - len(kept)
+            LOGS[:] = kept
+            # 重建索引
+            LOGS_INDEX = {str(l.get("log_id", "")) for l in LOGS if l.get("log_id")}
+            if removed > 0:
+                save_logs()
+        audit_log("delete_old_logs", "admin", {"removed": removed, "days": days, "remaining": len(LOGS)})
+        log_request("POST", "/api/delete_old_logs", 200, self.client_address[0],
+                    f"removed={removed}, remaining={len(LOGS)}")
+        return self._send_json(HTTPStatus.OK, {
+            "ok": True, "removed": removed, "remaining": len(LOGS),
         })
 
     def _handle_dedup(self):
