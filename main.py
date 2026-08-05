@@ -131,12 +131,23 @@ class CheckMaliciousMessagePlugin(Star):
             "last_uploaded_records": 0, # 上次上传的记录数
             "last_pulled_records": 0,    # 上次拉取的记录数
             "last_pulled_special": 0,   # 上次拉取的特殊记录数
+            "last_log_upload_ts": 0.0,  # 备案日志上传水位（仅上传 time > 此值的日志）
         }
         # 云同步进行中标志（避免重入与回环同步）
         self._cloud_syncing = False
         # 待推送队列：在警告发生时累积，由后台任务统一推送
         self._cloud_pending_push: set[str] = set()  # 待推送记录的 key 集合
         self._cloud_pending_special: int = 0  # 待推送的特殊记录条数
+        # 待重试的合法衰减 key（_cloud_push_decay 失败时累积，full_sync 重试）
+        self._cloud_pending_decay: set[str] = set()
+
+        # 后台任务健康监控（验证计数器 + 心跳时间戳）
+        # 用于检测并自愈「循环卡死 / 任务静默退出」问题
+        self._decay_heartbeat: float = time.time()   # 衰减循环最近一次心跳
+        self._decay_iter_count: int = 0                # 衰减循环累计迭代次数
+        self._cloud_heartbeat: float = time.time()     # 云同步循环最近一次心跳
+        self._cloud_iter_count: int = 0                # 云同步循环累计迭代次数
+        self._last_health_check_ts: float = 0.0        # 上次健康检查时间（节流用）
 
         self._load()
         self._apply_pending_decrements()
@@ -300,11 +311,113 @@ class CheckMaliciousMessagePlugin(Star):
                 pass
         self._save()
 
+    # ------------------------------------------------------------------ 后台任务健康检查（自愈看门狗）
+    #
+    # 设计目的：用户反馈「自动同步 / 自动衰减跑一会就崩了，只会循环一次」。
+    # 根因可能是任务异常退出、被事件循环回收、或状态时间戳未持久化。
+    # 本看门狗在每条消息 & 每次同步时被调用（内部节流），做三件事：
+    #   1. 检测后台任务是否存活 → 死亡则重建；
+    #   2. 检测心跳是否停滞（任务活着但卡住）→ 取消并重建；
+    #   3. 检测状态时间戳是否过期 → 触发补偿（补衰减 / 补同步）。
+
+    def _restart_decrement_task(self, reason: str = "") -> None:
+        """（重新）启动衰减后台任务。"""
+        if self._decrement_task is not None and not self._decrement_task.done():
+            self._decrement_task.cancel()
+        self._decay_heartbeat = time.time()
+        self._decrement_task = asyncio.create_task(self._decrement_loop())
+        logger.warning(f"[恶意消息检测] 衰减任务已重建（{reason}）")
+
+    def _restart_cloud_task(self, reason: str = "") -> None:
+        """（重新）启动云同步后台任务。"""
+        if self._cloud_task is not None and not self._cloud_task.done():
+            self._cloud_task.cancel()
+        self._cloud_heartbeat = time.time()
+        self._cloud_task = asyncio.create_task(self._cloud_sync_loop())
+        logger.warning(f"[恶意消息检测] 云同步任务已重建（{reason}）")
+
+    def _health_check(self, force: bool = False) -> None:
+        """看门狗：检查并修复后台任务状态。节流到每 60 秒最多一次（force 可跳过）。
+
+        - 任务为 None / 已结束 → 重建；
+        - 任务心跳停滞超过 3 倍间隔 → 视为卡死，取消并重建；
+        - last_decrement 落后超过 2 倍衰减间隔 → 立即补做一次衰减；
+        - last_attempt_ts 落后超过 2 倍同步间隔 → 立即补做一次同步（异步触发）。
+        """
+        now = time.time()
+        # 节流：默认每 60 秒最多检查一次，避免每条消息都跑全量检查
+        if not force and (now - self._last_health_check_ts) < 60:
+            return
+        self._last_health_check_ts = now
+
+        # ---- 1. 衰减任务存活 & 心跳 ----
+        decay_alive = self._decrement_task is not None and not self._decrement_task.done()
+        if not decay_alive:
+            self._restart_decrement_task("任务未存活")
+        else:
+            # 心跳停滞检测：超过 3 倍衰减间隔没心跳 = 卡死
+            hb_age = now - float(self._decay_heartbeat or 0)
+            if hb_age > 3 * DECAY_INTERVAL:
+                logger.warning(
+                    f"[恶意消息检测] 衰减任务心跳停滞 {int(hb_age)}s，iter={self._decay_iter_count}，重建任务"
+                )
+                self._restart_decrement_task(f"心跳停滞 {int(hb_age)}s")
+
+        # ---- 2. 云同步任务存活 & 心跳 ----
+        cloud_alive = self._cloud_task is not None and not self._cloud_task.done()
+        if not cloud_alive:
+            self._restart_cloud_task("任务未存活")
+        else:
+            try:
+                sync_interval = max(30, int(self.config.get("cloud_sync_interval", CLOUD_DEFAULT_INTERVAL) or CLOUD_DEFAULT_INTERVAL))
+            except (TypeError, ValueError):
+                sync_interval = CLOUD_DEFAULT_INTERVAL
+            hb_age = now - float(self._cloud_heartbeat or 0)
+            if hb_age > 3 * sync_interval:
+                logger.warning(
+                    f"[恶意消息检测] 云同步任务心跳停滞 {int(hb_age)}s，iter={self._cloud_iter_count}，重建任务"
+                )
+                self._restart_cloud_task(f"心跳停滞 {int(hb_age)}s")
+
+        # ---- 3. 状态时间戳补偿（catch-up）----
+        # 衰减：若 last_decrement 落后超过 2 倍间隔，立即补衰减
+        last_dec = float(self._meta.get("last_decrement", now) or now)
+        if now - last_dec > 2 * DECAY_INTERVAL:
+            logger.warning(
+                f"[恶意消息检测] 检测到衰减落后 {int(now - last_dec)}s > 2×{DECAY_INTERVAL}s，补做一次衰减"
+            )
+            try:
+                asyncio.create_task(self._do_decrement())
+            except RuntimeError:
+                # 事件循环未就绪时降级
+                pass
+
+        # 云同步：若 last_attempt_ts 落后超过 2 倍间隔，异步触发一次同步
+        if self._cloud_enabled() and not self._cloud_syncing:
+            try:
+                sync_interval = max(30, int(self.config.get("cloud_sync_interval", CLOUD_DEFAULT_INTERVAL) or CLOUD_DEFAULT_INTERVAL))
+            except (TypeError, ValueError):
+                sync_interval = CLOUD_DEFAULT_INTERVAL
+            last_att = float(self._cloud.get("last_attempt_ts", 0) or 0)
+            if last_att > 0 and (now - last_att) > 2 * sync_interval:
+                logger.warning(
+                    f"[恶意消息检测] 检测到同步落后 {int(now - last_att)}s > 2×{sync_interval}s，补做一次同步"
+                )
+                try:
+                    asyncio.create_task(self._cloud_full_sync())
+                except RuntimeError:
+                    pass
+
     # ------------------------------------------------------------------ 主流程
 
     @filter.event_message_type(filter.EventMessageType.ALL, priority=30)
     async def on_message(self, event: AstrMessageEvent):
         """监听所有消息，检测是否含有严重恶意内容。"""
+        # 看门狗：每条消息都尝试健康检查（内部节流），自愈卡死/退出的后台任务
+        try:
+            self._health_check()
+        except Exception as e:
+            logger.warning(f"[恶意消息检测] 健康检查异常: {e}")
         try:
             result = await self._check(event)
         except Exception as e:  # 任何异常都不应阻断正常聊天
@@ -1400,9 +1513,12 @@ class CheckMaliciousMessagePlugin(Star):
         - 每次衰减后记录 last_decrement = now
         - 下一次衰减时间 = last_decrement + DECAY_INTERVAL
         - 若当前已超过下次衰减时间（如停机期间错过了），立即补做一次
+        - 每次迭代 / 每个 sleep 分段都更新 _decay_heartbeat 心跳，供 _health_check 自愈使用
         """
         while True:
             try:
+                self._decay_heartbeat = time.time()
+                self._decay_iter_count += 1
                 now = time.time()
                 last = float(self._meta.get("last_decrement", now) or now)
                 next_fire = last + DECAY_INTERVAL
@@ -1414,6 +1530,7 @@ class CheckMaliciousMessagePlugin(Star):
                 wait = next_fire - time.time()
                 # 分段等待，避免一次 sleep 过长无法及时响应
                 while wait > 0:
+                    self._decay_heartbeat = time.time()
                     chunk = min(wait, 60)
                     await asyncio.sleep(chunk)
                     wait -= chunk
@@ -1426,16 +1543,36 @@ class CheckMaliciousMessagePlugin(Star):
                 await asyncio.sleep(60)
 
     async def _do_decrement(self):
-        """执行一次衰减：所有用户 count -1（不低于 0）。"""
+        """执行一次衰减：所有用户 count -1（不低于 0）。
+
+        衰减后同步推送「合法衰减」到云端（仅本 bot 上传的数据可被衰减，服务端鉴权）。
+        """
         changed = False
-        for rec in self._records.values():
-            if rec.get("count", 0) > 0:
-                rec["count"] = max(0, rec.get("count", 0) - 1)
+        decayed_keys: list[str] = []
+        # ★ 迭代快照，避免与 on_message 并发修改字典触发 RuntimeError
+        for key, rec in list(self._records.items()):
+            old_count = int(rec.get("count", 0) or 0)
+            if old_count > 0:
+                rec["count"] = max(0, old_count - 1)
                 changed = True
+                decayed_keys.append(key)
         self._meta["last_decrement"] = time.time()
-        if changed:
-            self._save()
-        logger.info("[恶意消息检测] 每 2 小时衰减：所有用户警告次数 -1")
+        # ★ 始终持久化，即使 changed=False，也要保存 last_decrement 时间戳
+        # （否则重载后会用旧时间戳，导致「只衰减一次」/倒计时错乱）
+        self._save()
+        logger.info(
+            f"[恶意消息检测] 每 2 小时衰减完成: changed={changed}, decayed={len(decayed_keys)}, "
+            f"last_decrement={self._fmt_ts(self._meta['last_decrement'])}"
+        )
+        # ★ 合法衰减同步：把本次实际衰减的 key 推送到云端
+        # 受 enable_cloud_revoke 控制（默认 True），不依赖 enable_cloud_sync_count
+        # 服务端会校验 bot_id in sources，仅衰减本 bot 上传的数据
+        if decayed_keys and self._cloud_enabled() and self._cloud_feature_enabled("enable_cloud_revoke", True):
+            try:
+                asyncio.create_task(self._cloud_push_decay(decayed_keys))
+            except RuntimeError:
+                # 事件循环未就绪时累积到 pending，由 full_sync 重试
+                self._cloud_pending_decay.update(decayed_keys)
 
     def _apply_pending_decrements(self):
         """加载时补算停机期间应衰减的次数。"""
@@ -1942,7 +2079,9 @@ class CheckMaliciousMessagePlugin(Star):
             local = self._records.get(k)
             if local is None:
                 # 远端有而本地没有：仅当同步开关开启时才创建（避免误植入禁言风险）
-                if not (sync_count or sync_mute):
+                # 管理员强制覆盖（admin_rev > 0）也允许创建
+                remote_admin_rev = int(r.get("admin_rev", 0) or 0)
+                if not (sync_count or sync_mute or remote_admin_rev > 0):
                     continue
                 local = {
                     "user_id": uid,
@@ -1955,9 +2094,21 @@ class CheckMaliciousMessagePlugin(Star):
                     "last_reason": "",
                     "last_muted_until": 0,
                     "cloud_source": True,
+                    "admin_rev": remote_admin_rev,
                 }
                 self._records[k] = local
-            # count 同步
+            # ★ 管理员强制覆盖：admin_rev 升高时，无条件采用远端 count，绕过 max() 与 sync_count 开关
+            # 这使管理员清零等操作能强制下发到客户端（即使本地 count 更高）
+            remote_admin_rev = int(r.get("admin_rev", 0) or 0)
+            local_admin_rev = int(local.get("admin_rev", 0) or 0)
+            if remote_admin_rev > local_admin_rev:
+                local["count"] = int(r.get("count", 0) or 0)
+                local["admin_rev"] = remote_admin_rev
+                applied += 1
+                logger.info(
+                    f"[恶意消息检测] 管理员强制覆盖: key={k}, count→{local['count']}, admin_rev={remote_admin_rev}"
+                )
+            # count 同步（普通 max 合并，仅在 sync_count 开启时）
             if sync_count:
                 remote_count = int(r.get("count", 0) or 0)
                 if remote_count > int(local.get("count", 0) or 0):
@@ -2091,11 +2242,105 @@ class CheckMaliciousMessagePlugin(Star):
         self._cloud_record_error(f"push_incremental: {msg}")
         return {"ok": False, "error": msg, "applied": 0}
 
+    async def _cloud_push_decay(self, keys: list[str]) -> dict:
+        """推送合法衰减到云端（POST /api/decay）。
+
+        服务端鉴权：bot_id 必须在 record.sources 中（仅能衰减本 bot 上传的数据）；
+        使用 admin_token 时跳过该校验。失败的 key 累积到 _cloud_pending_decay 供 full_sync 重试。
+        """
+        if not keys or not self._cloud_enabled():
+            return {"ok": False, "error": "未启用或无 key"}
+        body = {"bot_id": self._cloud_bot_id(), "keys": list(keys)}
+        try:
+            status, resp = await self._cloud_http_request("POST", "/api/decay", body=body)
+        except Exception as e:
+            self._cloud_record_error(f"decay: {e}")
+            self._cloud_pending_decay.update(keys)
+            return {"ok": False, "error": str(e)}
+        if status == 200 and resp.get("ok"):
+            decayed = resp.get("decayed", []) or []
+            denied = resp.get("denied", []) or []
+            not_found = resp.get("not_found", []) or []
+            # 成功推送，清空 pending（denied/not_found 的 key 不再重试，属正常）
+            for k in keys:
+                self._cloud_pending_decay.discard(k)
+            logger.info(
+                f"[恶意消息检测] 合法衰减已同步云端: decayed={len(decayed)}, "
+                f"denied={len(denied)}, not_found={len(not_found)}"
+            )
+            return {"ok": True, "decayed": len(decayed), "denied": len(denied), "not_found": len(not_found)}
+        msg = resp.get("error") or f"HTTP {status}"
+        self._cloud_record_error(f"decay: {msg}")
+        self._cloud_pending_decay.update(keys)
+        return {"ok": False, "error": msg}
+
+    async def _cloud_upload_logs(self) -> dict:
+        """上传备案日志（个体警告事件）到云端。仅上传 time > last_log_upload_ts 的新日志，按 log_id 去重。"""
+        if not self._cloud_enabled():
+            return {"ok": False, "error": "云同步未启用", "uploaded": 0}
+        if not self._cloud_feature_enabled("enable_cloud_upload_record", True):
+            return {"ok": False, "error": "上传记录子功能未开启", "uploaded": 0}
+        watermark = float(self._cloud.get("last_log_upload_ts", 0) or 0)
+        # 取水位之后的新日志，按时间升序
+        new_logs = [l for l in self._logs if float(l.get("time", 0) or 0) > watermark]
+        if not new_logs:
+            return {"ok": True, "uploaded": 0}
+        new_logs.sort(key=lambda l: float(l.get("time", 0) or 0))
+        total_uploaded = 0
+        total_skipped = 0
+        # 分批上传（每批 200 条）
+        batch_size = 200
+        for i in range(0, len(new_logs), batch_size):
+            batch = new_logs[i: i + batch_size]
+            items = []
+            for l in batch:
+                items.append({
+                    "log_id": str(l.get("log_id", "")),
+                    "time": float(l.get("time", 0) or 0),
+                    "time_str": str(l.get("time_str", "")),
+                    "user_id": str(l.get("user_id", "")),
+                    "sender_name": str(l.get("sender_name", "")),
+                    "platform": str(l.get("platform", "")),
+                    "platform_id": str(l.get("platform_id", "")),
+                    "group_id": str(l.get("group_id", "")),
+                    "is_private": bool(l.get("is_private", False)),
+                    "message": str(l.get("message", ""))[:500],
+                    "reason": str(l.get("reason", "")),
+                    "count": int(l.get("count", 0) or 0),
+                    "muted": bool(l.get("muted", False)),
+                    "mute_minutes": int(l.get("mute_minutes", 0) or 0),
+                    "is_admin": bool(l.get("is_admin", False)),
+                    "revoked": bool(l.get("revoked", False)),
+                })
+            body = {"bot_id": self._cloud_bot_id(), "logs": items}
+            try:
+                status, resp = await self._cloud_http_request("POST", "/api/upload_logs", body=body)
+            except Exception as e:
+                self._cloud_record_error(f"upload_logs: {e}")
+                return {"ok": False, "error": str(e), "uploaded": total_uploaded}
+            if status == 200 and resp.get("ok"):
+                total_uploaded += int(resp.get("uploaded", 0))
+                total_skipped += int(resp.get("skipped", 0))
+                # 推进水位到本批最大 time（仅成功批次推进，失败下次重试）
+                self._cloud["last_log_upload_ts"] = max(float(l.get("time", 0) or 0) for l in batch)
+            else:
+                msg = resp.get("error") or f"HTTP {status}"
+                self._cloud_record_error(f"upload_logs: {msg}")
+                return {"ok": False, "error": msg, "uploaded": total_uploaded}
+        self._save()
+        logger.info(f"[恶意消息检测] 备案日志上传完成: uploaded={total_uploaded}, skipped={total_skipped}")
+        return {"ok": True, "uploaded": total_uploaded, "skipped": total_skipped}
+
     async def _cloud_full_sync(self) -> dict:
         """执行一次完整同步：拉取 → 推送本地记录 → 推送增量禁言状态 → 推送特殊记录。
 
         本地数据始终保留（云端为补充）。仅在启用对应子功能时执行对应步骤。
         """
+        # 看门狗：每次同步前检查并修复后台任务状态（用户建议：每次同步时检查并修复状态）
+        try:
+            self._health_check(force=True)
+        except Exception as e:
+            logger.warning(f"[恶意消息检测] 同步前健康检查异常: {e}")
         if not self._cloud_enabled():
             return {"ok": False, "error": "云同步未启用"}
         if self._cloud_syncing:
@@ -2132,6 +2377,15 @@ class CheckMaliciousMessagePlugin(Star):
                 if special_result.get("ok"):
                     self._cloud_pending_special = 0
 
+            # 5. 重试失败的合法衰减推送
+            decay_result = {"ok": True, "decayed": 0}
+            if self._cloud_pending_decay:
+                pending_decay = list(self._cloud_pending_decay)
+                decay_result = await self._cloud_push_decay(pending_decay)
+
+            # 6. 上传备案日志（新警告事件）
+            logs_result = await self._cloud_upload_logs()
+
             self._cloud_record_success("sync")
             self._save()
             return {
@@ -2140,6 +2394,8 @@ class CheckMaliciousMessagePlugin(Star):
                 "upload": upload_result,
                 "incremental": inc_result,
                 "special": special_result,
+                "decay": decay_result,
+                "logs": logs_result,
             }
         except Exception as e:
             self._cloud_record_error(f"full_sync: {e}")
@@ -2163,6 +2419,8 @@ class CheckMaliciousMessagePlugin(Star):
         await asyncio.sleep(15)
         while True:
             try:
+                self._cloud_heartbeat = time.time()
+                self._cloud_iter_count += 1
                 if not self._cloud_enabled():
                     await asyncio.sleep(30)
                     continue
@@ -2183,6 +2441,7 @@ class CheckMaliciousMessagePlugin(Star):
                 wait = next_fire - time.time()
                 # 分段等待，避免一次 sleep 过长无法及时响应
                 while wait > 0:
+                    self._cloud_heartbeat = time.time()
                     chunk = min(wait, 60)
                     await asyncio.sleep(chunk)
                     wait -= chunk
@@ -2284,11 +2543,19 @@ class CheckMaliciousMessagePlugin(Star):
         )
 
     async def _api_logs(self):
-        """返回被警告消息备案（最近 500 条，倒序）。"""
+        """返回被警告消息备案（倒序）。支持按 user_id/platform_id 过滤（供详情弹窗使用）。"""
         limit = request.query.get("limit", 200, type=int) or 200
-        items = list(reversed(self._logs))[:limit]
+        uid = (request.query.get("user_id", "") or "").strip()
+        pid = (request.query.get("platform_id", "") or "").strip()
+        items = list(reversed(self._logs))
+        if uid:
+            items = [l for l in items if str(l.get("user_id", "")) == uid]
+        if pid:
+            items = [l for l in items if str(l.get("platform_id", "")) == pid]
+        total = len(items)
+        items = items[:limit]
         return json_response(
-            {"total": len(self._logs), "items": items}
+            {"total": total, "items": items}
         )
 
     async def _api_reset(self):
@@ -2521,6 +2788,18 @@ class CheckMaliciousMessagePlugin(Star):
             },
             "syncing": self._cloud_syncing,
             "server_time": time.time(),
+            "watchdog": {
+                "decay_task_alive": self._decrement_task is not None and not self._decrement_task.done(),
+                "decay_iter_count": int(self._decay_iter_count),
+                "decay_heartbeat_ts": float(self._decay_heartbeat or 0),
+                "decay_heartbeat_str": self._fmt_ts(float(self._decay_heartbeat or 0)),
+                "cloud_task_alive": self._cloud_task is not None and not self._cloud_task.done(),
+                "cloud_iter_count": int(self._cloud_iter_count),
+                "cloud_heartbeat_ts": float(self._cloud_heartbeat or 0),
+                "cloud_heartbeat_str": self._fmt_ts(float(self._cloud_heartbeat or 0)),
+                "last_health_check_ts": float(self._last_health_check_ts or 0),
+                "last_health_check_str": self._fmt_ts(float(self._last_health_check_ts or 0)),
+            },
         }
         return json_response(status)
 

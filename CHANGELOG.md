@@ -1,5 +1,62 @@
 # 更新日志
 
+## v1.4.0 — 2026-08-05
+
+### 新增功能
+
+- **⬇️ 合法衰减机制**：服务端的警告次数（x）不再随本地衰减而自动减少，而是通过「合法衰减」协议同步。
+  - **合法衰减定义**：本地上传的数据只能由同一标识 `bot_id` 的任意端、或持有 `admin_token` 的管理端、或调用 API 衰减；
+  - **服务端**（`cloud_server/server.py`）：
+    - 新增 `POST /api/decay` 端点（admin_token 或 client_token 鉴权）；
+    - 非 admin 请求强制校验 `bot_id` 在记录的 `sources` 中，否则拒绝（`denied`）；
+    - admin 衰减跳过 sources 校验，可衰减任意记录；
+  - **客户端**（`main.py`）：
+    - 本地每次执行全局衰减时，通过 `_cloud_push_decay()` 推送衰减到云端；
+    - 推送失败时记录到 `_cloud_pending_decay` 集合，下次同步重试；
+    - 衰减权限校验：仅上传该警告的 bot 才能衰减云端记录。
+
+- **🔧 管理员强制覆盖（admin_rev）**：管理员修改记录时，客户端下次同步强制下载被 admin 变更的条目。
+  - **服务端**：`merge_record` 新增 `admin_rev` 字段（初始 0），管理员清零时 `+1`；
+  - **客户端**：`_cloud_apply_remote_records` 检测到 `remote.admin_rev > local.admin_rev` 时，**强制覆盖**本地 `count`，无论本地值多大；
+  - 新增 `POST /api/zero_count` 端点（admin_token 鉴权）：将指定 key 的 count 清零并 bump `admin_rev`；
+  - WebUI 记录页新增「清零」按钮和「清零选中」批量操作。
+
+- **📄 备案页面**：将原「警告记录」页面职能改为「警告次数统计」，新增独立的「备案」标签页。
+  - **服务端**：
+    - 新增 `LOGS` 存储层（个体警告事件，由客户端上传，按 `log_id` 去重，FIFO 截断至 50000 条）；
+    - 新增 `POST /api/upload_logs` 端点（client_token）：客户端推送备案日志；
+    - 新增 `GET /api/logs` 端点（admin/client 均可读）：支持按 `user_id`/`platform_id` 过滤；
+    - 新增 `POST /api/delete_old_logs` 端点（admin_token）：删除存放超过 N 天的日志（默认 7 天）；
+  - **客户端**（`main.py`）：本地警告发生时记录日志（含 `log_id`），同步时上传到云端；
+  - **WebUI**（`cloud_server/web/`）：
+    - 重命名标签页「警告记录」→「警告次数统计」；
+    - 新增「备案」标签页，显示每次警告的句子与原因，支持搜索；
+    - 管理员可删除存放超过 7 天的日志。
+
+- **👥 用户警告详情弹窗**：警告次数统计页面（客户端 + 管理端）可点击被记录者名称，弹出窗口展示其每一次被警告的句子和原因。
+  - **服务端 WebUI**（`cloud_server/web/`）：
+    - 记录页和备案页的用户名均可点击；
+    - 弹窗调用 `GET /api/logs?user_id=...&platform_id=...` 获取该用户全部警告；
+    - 弹窗支持 ESC 关闭、点击遮罩关闭、✕ 按钮关闭；
+  - **客户端插件页**（`pages/stats/`）：
+    - 统计页和备案页的用户名均可点击；
+    - 调用本地 `/logs` API（已支持 `user_id`/`platform_id` 过滤）；
+    - 弹窗内展示时间、消息、原因、x 值、禁言状态、撤回标记。
+
+- **🗑 管理端记录保留策略**：admin 管理端保留全部记录，但只能删除存放超过 7 日的日志或清零该人的 x。
+  - 清零操作通过 `admin_rev` 强制下发到所有客户端；
+  - 删除旧日志通过 `/api/delete_old_logs` 端点执行。
+
+### 修改
+
+- 服务端版本号 `1.3.1` → `1.4.0`；
+- 插件版本号 `1.3.1` → `1.4.0`；
+- `cloud_server/web/index.html`：移除 `userLogsModal` 的 `hidden` 属性，改用 `.show` 类控制显示（与 confirmModal 一致）；
+- `cloud_server/web/style.css`：新增 `modal-box-wide`、`modal-header`、`user-logs-body`、`user-logs-list`、`log-entry`、`user.clickable` 等样式；
+- `pages/stats/style.css`：同步新增弹窗样式。
+
+---
+
 ## v1.3.1 — 2026-08-05
 
 ### 新增功能
@@ -44,7 +101,19 @@
 
 ### 修复
 
-- **云同步卡死问题**：修复同步运行一段时间后「距下次同步」卡死在"即将"且自动同步不再触发的问题。
+- **🔄 自动同步 / 自动衰减「只会循环一次」彻底修复**：增加自愈看门狗 + 心跳计数器，并修复两个根因 bug。
+  - **根因 1（衰减时间戳未持久化）**：`_do_decrement` 仅在 `changed=True`（有用户 count>0）时才调用 `_save()`。当所有用户 count 已为 0 时，`last_decrement` 仅更新到内存而未落盘；插件重载后从磁盘读回旧值，导致倒计时错乱、重复补衰减或「只衰减一次」。
+    - 修复：`_do_decrement` 现在**始终调用 `_save()`** 持久化 `last_decrement`，无论是否有用户被衰减。
+  - **根因 2（并发迭代崩溃）**：`_do_decrement` 直接迭代 `self._records.values()`，而 `on_message` 可能并发向字典新增记录，触发 `RuntimeError: dictionary changed size during iteration`，异常被外层捕获后**跳过衰减且不更新 `last_decrement`**，循环表现异常。
+    - 修复：改用 `list(self._records.values())` 快照迭代，杜绝并发修改异常。
+  - **新增自愈看门狗**（`_health_check`，用户建议方案）：
+    - 衰减循环与云同步循环每次迭代 / 每个 sleep 分段都更新**心跳时间戳** `_decay_heartbeat` / `_cloud_heartbeat` 与**迭代计数器** `_decay_iter_count` / `_cloud_iter_count`；
+    - 看门狗在**每条消息**和**每次同步前**被调用（内部 60 秒节流），执行三项自愈：
+      1. 任务为 None / 已结束 → 立即重建（`_restart_decrement_task` / `_restart_cloud_task`）；
+      2. 任务心跳停滞超过 3 倍间隔 → 视为卡死，取消并重建；
+      3. `last_decrement` 落后超过 2 倍衰减间隔 → 异步补做一次衰减；`last_attempt_ts` 落后超过 2 倍同步间隔 → 异步补做一次同步；
+    - 云同步状态 API（`/cloud/status`）新增 `watchdog` 字段，暴露任务存活状态、迭代计数、心跳时间，便于排查。
+- **云同步卡死问题（旧）**：修复同步运行一段时间后「距下次同步」卡死在"即将"且自动同步不再触发的问题。
   - 根因：`last_attempt_ts` 仅在同步循环内部更新，手动同步 API `_api_cloud_sync` 未更新该时间戳，导致手动同步后倒计时仍显示旧时间戳；
   - 修复：
     - 将 `last_attempt_ts` 更新逻辑从同步循环移入 `_cloud_full_sync` 方法开头，**所有调用路径**（循环触发、手动API、定时同步）都会统一更新时间戳；
