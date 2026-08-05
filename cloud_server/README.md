@@ -144,7 +144,7 @@ docker run -d --name malicious-cloud -p 8765:8765 -v $(pwd)/data:/app/data -v $(
 curl http://localhost:8765/api/health
 
 # 期望返回:
-# {"ok": true, "version": "1.1.0", "records": 0, "special_records": 0, ...}
+# {"ok": true, "version": "1.2.0", "records": 0, "special_records": 0, ...}
 
 # 带鉴权的统计查询
 curl -H "X-Client-Token: 你的client_token" http://localhost:8765/api/stats
@@ -324,8 +324,8 @@ sudo systemctl restart malicious-cloud
 
 ## 版本
 
-- 服务端版本：1.1.0
-- 配套插件版本：>= 1.1.0
+- 服务端版本：1.2.0
+- 配套插件版本：>= 1.2.1
 
 ## 反馈
 
