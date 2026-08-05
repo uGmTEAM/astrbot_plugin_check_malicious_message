@@ -667,14 +667,48 @@ async function cloudUploadSpecial() {
   }
 }
 
+async function cloudDedup() {
+  const choice = await asyncPrompt("去重类型：留空=全部，records=仅记录，special=仅特殊", { defaultVal: "" });
+  if (choice === null) return;
+  const type = (choice || "").trim().toLowerCase();
+  if (!["", "records", "special"].includes(type)) {
+    toast("无效类型", "error");
+    return;
+  }
+  const typeLabel = type === "" ? "全部" : type === "records" ? "仅记录" : "仅特殊";
+  if (!(await asyncConfirm(`确认执行${typeLabel}去重？\n记录：清理僵尸（count=0/未禁言/超30天）\n特殊：按指纹去重`))) return;
+  try {
+    const res = await bridge.apiPost("cloud/dedup", { type });
+    const data = res && res.data !== undefined ? res.data : res;
+    if (data && data.ok) {
+      const local = data.local || {};
+      const cloud = data.cloud || {};
+      const cr = cloud.records || {};
+      const cs = cloud.special || {};
+      const parts = [];
+      if (local.removed !== undefined) parts.push(`本地清理 ${local.removed} 条`);
+      if (cr.removed !== undefined) parts.push(`云端记录清理 ${cr.removed} 条`);
+      if (cs.removed !== undefined) parts.push(`云端特殊去重 ${cs.removed} 条`);
+      toast(`✅ 去重完成（${typeLabel}）：${parts.join("，") || "无变化"}`, "ok");
+    } else {
+      toast("去重失败：" + (data && data.error ? data.error : "未知错误"), "error");
+    }
+    await loadCloud();
+  } catch (e) {
+    toast("去重失败：" + (e && e.message ? e.message : e), "error");
+  }
+}
+
 // 云同步按钮事件
 const cloudSyncBtn = document.getElementById("cloudSyncBtn");
 const cloudUploadBtn = document.getElementById("cloudUploadBtn");
 const cloudUploadSpecialBtn = document.getElementById("cloudUploadSpecialBtn");
+const cloudDedupBtn = document.getElementById("cloudDedupBtn");
 const cloudRefreshBtn = document.getElementById("cloudRefreshBtn");
 if (cloudSyncBtn) cloudSyncBtn.addEventListener("click", cloudSyncNow);
 if (cloudUploadBtn) cloudUploadBtn.addEventListener("click", cloudUploadRecords);
 if (cloudUploadSpecialBtn) cloudUploadSpecialBtn.addEventListener("click", cloudUploadSpecial);
+if (cloudDedupBtn) cloudDedupBtn.addEventListener("click", cloudDedup);
 if (cloudRefreshBtn) cloudRefreshBtn.addEventListener("click", loadCloud);
 
 (async () => {
