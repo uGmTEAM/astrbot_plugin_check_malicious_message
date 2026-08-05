@@ -1,0 +1,54 @@
+# 恶意消息检测插件 - 云同步服务端 systemd 服务文件
+# 部署步骤（Ubuntu / Debian）:
+#   1. 将整个 cloud_server 目录上传到服务器，例如 /opt/malicious-cloud/
+#      sudo mkdir -p /opt/malicious-cloud
+#      sudo cp -r cloud_server/* /opt/malicious-cloud/
+#   2. 修改 config.json 中的 token（client_token 与 admin_token 必须不同且足够长）
+#      sudo nano /opt/malicious-cloud/config.json
+#   3. 修改本服务文件中的路径（如有不同），然后复制到 systemd 目录:
+#      sudo cp /opt/malicious-cloud/malicious-cloud.service /etc/systemd/system/
+#   4. 启动并设为开机自启:
+#      sudo systemctl daemon-reload
+#      sudo systemctl enable malicious-cloud
+#      sudo systemctl start malicious-cloud
+#      sudo systemctl status malicious-cloud
+#   5. 查看日志:
+#      sudo journalctl -u malicious-cloud -f
+#   6. 测试健康检查:
+#      curl http://localhost:8765/api/health
+
+[Unit]
+Description=Malicious Message Detection - Cloud Sync Server
+Documentation=https://github.com/AstrBotDevs/AstrBot
+After=network.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=www-data
+Group=www-data
+WorkingDirectory=/opt/malicious-cloud
+ExecStart=/usr/bin/python3 /opt/malicious-cloud/server.py --config /opt/malicious-cloud/config.json
+Restart=on-failure
+RestartSec=5s
+StandardOutput=journal
+StandardError=journal
+# 安全加固
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/malicious-cloud/data /opt/malicious-cloud/logs
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=true
+LockPersonality=true
+MemoryDenyWriteExecute=false
+# 资源限制
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,9 @@
+# 恶意消息检测插件 - 云同步服务端
+# 本服务端仅使用 Python 标准库，无需安装任何第三方依赖。
+# 需要 Python >= 3.8（推荐 3.10+）。
+#
+# Ubuntu / Debian 安装 Python:
+#   sudo apt update && sudo apt install -y python3 python3-venv
+#
+# 无需 pip install 任何包。直接运行:
+#   python3 server.py
