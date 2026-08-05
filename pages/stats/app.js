@@ -549,7 +549,10 @@ async function loadCloud() {
     html += `&nbsp;&nbsp;• 误判撤回: ${featureBadge(feat.revoke)}<br>`;
     html += "<b>统计：</b><br>";
     html += `&nbsp;&nbsp;• 累计同步 ${stats.sync_count || 0} 次，推送 ${stats.push_count || 0} 次，拉取 ${stats.pull_count || 0} 次，错误 ${stats.error_count || 0} 次<br>`;
-    html += `&nbsp;&nbsp;• 上次同步: ${escapeHtml(timing.last_sync_str || "-")} · 距下次同步: ${fmtCountdown(timing.next_sync_in || 0)}<br>`;
+    html += `&nbsp;&nbsp;• 上次成功同步: ${escapeHtml(timing.last_sync_str || "-")} · 距下次同步: ${fmtCountdown(timing.next_sync_in || 0)}<br>`;
+    if (timing.last_attempt_str && timing.last_attempt_str !== timing.last_sync_str) {
+      html += `&nbsp;&nbsp;• 上次尝试同步: ${escapeHtml(timing.last_attempt_str)}（同步可能失败）<br>`;
+    }
     html += `&nbsp;&nbsp;• 上次上传: ${stats.last_uploaded_records || 0} 条 · 上次拉取: 记录 ${stats.last_pulled_records || 0} 条，特殊 ${stats.last_pulled_special || 0} 条<br>`;
     html += `&nbsp;&nbsp;• 待推送: ${pending.push_keys || 0} 条记录，${pending.special || 0} 条特殊记录${pending.syncing ? ' · <span class="badge low">同步中</span>' : ""}<br>`;
     if (errs.last_error) {
