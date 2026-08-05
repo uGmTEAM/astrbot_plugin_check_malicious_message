@@ -1,0 +1,254 @@
+{
+  "enable": {
+    "description": "是否启用恶意消息检测",
+    "type": "bool",
+    "default": true,
+    "hint": "关闭后插件不再对任何消息进行检测。"
+  },
+  "provider_id": {
+    "description": "用于检测/生成警告的模型提供商",
+    "type": "string",
+    "default": "",
+    "hint": "留空则自动使用当前会话配置的聊天模型提供商。建议选用响应快、成本低的模型（如各厂商的 flash / mini 系列）以降低延迟与开销。",
+    "_special": "select_provider"
+  },
+  "scan_private": {
+    "description": "是否检测私聊消息",
+    "type": "bool",
+    "default": true,
+    "hint": "私聊触发警告时只累计 x，不尝试禁言。"
+  },
+  "scan_group": {
+    "description": "是否检测群聊消息",
+    "type": "bool",
+    "default": true
+  },
+  "scan_command": {
+    "description": "是否检测指令消息（以指令前缀开头的消息）",
+    "type": "bool",
+    "default": false,
+    "hint": "默认不检测指令，避免对 /help 等指令产生额外开销。"
+  },
+  "command_prefixes": {
+    "description": "指令前缀列表",
+    "type": "list",
+    "default": ["/"],
+    "hint": "当“检测指令消息”关闭时，以这些前缀开头的消息会被跳过。如果你修改过唤醒前缀，请同步修改此处。"
+  },
+  "min_length": {
+    "description": "最小检测长度",
+    "type": "int",
+    "default": 2,
+    "hint": "短于此长度的纯文本消息不检测，以节省开销。建议 2-6。"
+  },
+  "max_length": {
+    "description": "单条消息最大检测长度",
+    "type": "int",
+    "default": 500,
+    "hint": "超过此长度的消息会被截断后再送检，避免消耗过多 token。"
+  },
+  "stop_event": {
+    "description": "检测到恶意消息时拦截事件传播",
+    "type": "bool",
+    "default": true,
+    "hint": "开启后，恶意消息将被拦截，机器人不会再对该消息做出后续回应（如 LLM 回复）。关闭则仅发送警告，不拦截。"
+  },
+  "warn_at_sender": {
+    "description": "警告时 @ 发送者",
+    "type": "bool",
+    "default": true,
+    "hint": "部分平台若不支持 @ 则自动回退为纯文本警告。"
+  },
+  "warn_message": {
+    "description": "模板警告文案（LLM 不可用时回退使用）",
+    "type": "text",
+    "default": "⚠️ {sender}，你发送的消息被判定为含有严重恶意内容（辱骂/人身攻击/骚扰/威胁/诈骗等），请遵守群规，文明发言。多次违规可能被禁言或移出。当前累计警告次数：{x}。",
+    "hint": "正常情况下警告文案由 LLM 以当前人格语气生成，本模板仅作兜底。支持占位符 {sender}、{x}、{reason}。"
+  },
+  "cooldown": {
+    "description": "同一用户警告冷却时间（秒）",
+    "type": "int",
+    "default": 0,
+    "hint": "避免对同一用户的连续消息重复警告。默认 0（不限制，每次恶意都计入 x）。如需抑制刷屏可设为 10-60。"
+  },
+  "enable_mute": {
+    "description": "是否启用自动禁言",
+    "type": "bool",
+    "default": true,
+    "hint": "仅对 aiocqhttp（OneBot 协议端）群聊生效，且要求机器人为群管理员。私聊或机器人非管理员的群不会尝试禁言。"
+  },
+  "mute_threshold": {
+    "description": "触发禁言的累计阈值 x",
+    "type": "int",
+    "default": 5,
+    "hint": "当某用户的警告次数 x 超过此值时触发禁言。例如 5 表示第 6 次警告开始禁言。"
+  },
+  "mute_multiplier": {
+    "description": "禁言时长倍数（分钟）",
+    "type": "int",
+    "default": 10,
+    "hint": "禁言分钟数 = 倍数 × 当前 x。例如 x=6、倍数=10 → 禁言 60 分钟。"
+  },
+  "mute_max_minutes": {
+    "description": "单次禁言上限（分钟）",
+    "type": "int",
+    "default": 43200,
+    "hint": "防止 x 过大导致超长禁言。默认 43200 分钟（30 天，OneBot 协议上限）。"
+  },
+  "whitelist_users": {
+    "description": "用户白名单",
+    "type": "list",
+    "default": [],
+    "hint": "不检测这些用户 ID 的消息，也不计入 x。可用于豁免管理员或信任用户。"
+  },
+  "whitelist_groups": {
+    "description": "群聊白名单",
+    "type": "list",
+    "default": [],
+    "hint": "不检测这些群 ID 的消息。"
+  },
+  "judge_prompt": {
+    "description": "判定恶意消息的系统提示词",
+    "type": "text",
+    "default": "你是一个内容安全审核助手。请判断用户发送的消息是否含有【严重】恶意内容。\n\n判定为严重恶意的标准（满足任一即可）：\n1. 严重辱骂、人身攻击、侮辱性、贬损性言语\n2. 骚扰、恐吓、威胁他人人身或财产安全\n3. 诈骗、诱导转账汇款、钓鱼链接、虚假中奖\n4. 煽动仇恨、歧视、暴力、自残自杀\n5. 散布违法信息（黄赌毒、暴恐、违禁品交易等）\n\n以下情况【不】判定为严重恶意：\n- 普通调侃、玩笑、轻微吐槽、阴阳怪气\n- 正常讨论、争论、表达不满或不同意见\n- 单独的表情符号、语气词\n- 不带恶意的网络用语\n\n请严格只输出如下 JSON，不要输出任何其他文字或解释：\n{\"malicious\": true, \"reason\": \"简要原因，不超过30字\"}\n或\n{\"malicious\": false, \"reason\": \"无\"}",
+    "hint": "可自定义判定标准。模型必须输出 {\"malicious\": bool, \"reason\": str} 格式的 JSON。"
+  },
+  "enable_spam_detect": {
+    "description": "是否启用刷屏检测",
+    "type": "bool",
+    "default": true,
+    "hint": "开启后，当单群单人在短时间内连续发送多条消息时，会调用 LLM 判断是否为无意义刷屏内容并决定是否警告。"
+  },
+  "spam_threshold": {
+    "description": "刷屏触发条数",
+    "type": "int",
+    "default": 3,
+    "hint": "单群单人在时间窗口内连续发送超过此条数的消息时触发刷屏检测。默认 3 条。"
+  },
+  "spam_window": {
+    "description": "刷屏检测时间窗口（秒）",
+    "type": "int",
+    "default": 10,
+    "hint": "在此秒数内发送的消息计为「连续」消息。默认 10 秒。"
+  },
+  "spam_prompt": {
+    "description": "刷屏检测的系统提示词",
+    "type": "text",
+    "default": "你是一个内容安全审核助手。请判断以下连续发送的多条消息是否属于无意义的刷屏内容（如重复无意义字符、纯表情刷屏、无逻辑的乱码等）。\n\n判定为刷屏的标准：\n1. 连续发送相同或高度相似的无意义内容\n2. 纯表情、颜文字、标点符号的刷屏\n3. 无逻辑的乱码、随机字符\n\n不判定为刷屏的情况：\n- 正常的连续对话、分多条表达一个完整意思\n- 有实际内容的消息（即使内容简短）\n- 转发、分享链接等有信息量的内容\n\n请严格只输出如下 JSON：\n{\"spam\": true, \"reason\": \"简要原因\"}\n或\n{\"spam\": false, \"reason\": \"无\"}",
+    "hint": "模型需输出 {\"spam\": bool, \"reason\": str} 格式的 JSON。"
+  },
+  "enable_anti_false_positive": {
+    "description": "是否启用防误判（二次判定）",
+    "type": "bool",
+    "default": true,
+    "hint": "开启后，当首次判定为严重恶意时，会结合该用户最近在本群发送的若干条文字消息进行二次判定，降低误判率。"
+  },
+  "anti_fp_context_count": {
+    "description": "防误判上下文消息条数",
+    "type": "int",
+    "default": 5,
+    "hint": "二次判定时取该用户最近在本群发送的多少条文字消息作为上下文。默认 5 条。"
+  },
+  "exempt_admin_from_warn": {
+    "description": "群管理员/群主豁免警告",
+    "type": "bool",
+    "default": true,
+    "hint": "开启后，群管理员和群主被判定为恶意时仍然会被记录并增加 x，但不会收到警告消息也不会被禁言。"
+  },
+  "enable_cross_group_mute": {
+    "description": "是否启用跨群禁言",
+    "type": "bool",
+    "default": true,
+    "hint": "开启后，当用户在一个群被禁言时，会自动在其他群（机器人同样为管理员、用户存在且非管理员）也执行禁言。"
+  },
+  "enable_special_record": {
+    "description": "是否启用特殊记录（政治敏感/违法内容）",
+    "type": "bool",
+    "default": true,
+    "hint": "开启后，当消息可能涉及政治敏感或违反法律的行为时，会单独记录到特殊记录页面，按人分类归档以便举报。"
+  },
+  "special_record_prompt": {
+    "description": "特殊记录检测的系统提示词",
+    "type": "text",
+    "default": "你是一个内容安全审核助手。请判断以下消息是否可能涉及政治敏感内容或包含违反法律的行为。\n\n判定为特殊记录的标准：\n1. 涉及政治敏感话题（如攻击国家领导人、颠覆国家政权、煽动分裂等）\n2. 涉及违法犯罪行为（如毒品交易、枪支买卖、诈骗教程等）\n3. 涉及暴恐、极端主义内容\n4. 涉及未成年人保护违规内容\n5. 其他可能需要向有关部门举报的内容\n\n不判定为特殊记录的情况：\n- 正常的政治讨论、时事评论\n- 学术研究、新闻报道引用\n- 不涉及违法的普通聊天\n\n请严格只输出如下 JSON：\n{\"special\": true, \"category\": \"分类（如：政治敏感/违法犯罪/暴恐/未成年人保护/其他）\", \"reason\": \"简要原因\"}\n或\n{\"special\": false, \"reason\": \"无\"}",
+    "hint": "模型需输出 {\"special\": bool, \"category\": str, \"reason\": str} 格式的 JSON。"
+  },
+  "archive_timeout_days": {
+    "description": "标准记录归档超时天数",
+    "type": "int",
+    "default": 7,
+    "hint": "一条标准备案记录被放置多少天后转移至超时记录页面。默认 7 天。特殊记录不受此限制。"
+  },
+  "enable_daily_summary": {
+    "description": "是否启用每日总结",
+    "type": "bool",
+    "default": true,
+    "hint": "开启后，每日自动总结一次警告情况，并执行超时记录归档。"
+  },
+  "enable_cloud_sync": {
+    "description": "是否启用云同步（总开关）",
+    "type": "bool",
+    "default": false,
+    "hint": "⚠️ 重要：开启后，所有使用本插件并开启云功能的 AI 数据共享，本地保留备份。请在可信网络环境下使用，并确保服务端 token 已配置。"
+  },
+  "cloud_server_url": {
+    "description": "云服务端 URL",
+    "type": "string",
+    "default": "",
+    "hint": "例如 http://your-server:8765 或 https://cloud.example.com。需自建 cloud_server（详见插件目录下 cloud_server/README.md）。"
+  },
+  "cloud_client_token": {
+    "description": "云客户端 Token（上传/同步用）",
+    "type": "string",
+    "default": "",
+    "hint": "与服务端 config.json 中的 client_token 一致。用于上传记录、拉取更新、推送增量。"
+  },
+  "cloud_admin_token": {
+    "description": "云管理员 Token（删除记录用）",
+    "type": "string",
+    "default": "",
+    "hint": "与服务端 config.json 中的 admin_token 一致。仅在「删除云端记录」子功能开启时使用，用于删除云端数据。"
+  },
+  "cloud_bot_id": {
+    "description": "本 Bot 唯一标识",
+    "type": "string",
+    "default": "",
+    "hint": "用于在云端区分数据来源。留空将自动生成一个随机 ID 并持久化。多 bot 共享同一服务端时建议各自填写有辨识度的 ID（如 qq_bot_001）。"
+  },
+  "cloud_sync_interval": {
+    "description": "云同步间隔（秒）",
+    "type": "int",
+    "default": 300,
+    "hint": "后台自动同步的最小间隔。默认 300 秒（5 分钟）。最小 30 秒。设为 30 可实现准实时同步（增加服务端压力）。"
+  },
+  "enable_cloud_upload_record": {
+    "description": "子功能：上传警告记录",
+    "type": "bool",
+    "default": true,
+    "hint": "开启后，本地警告记录会定期上传到云端（按 max 合并，不覆盖云端较大值）。相对安全，建议保持开启。"
+  },
+  "enable_cloud_sync_count": {
+    "description": "子功能：同步警告次数（+/-）",
+    "type": "bool",
+    "default": false,
+    "hint": "⚠️ 风险：开启后，其他 bot 警告该用户的次数会同步到本地，可能导致本地 count 暴涨并提前触发禁言。仅在多个 bot 服务于同一用户群体、希望统一计 warning 时才开启。"
+  },
+  "enable_cloud_sync_mute": {
+    "description": "子功能：同步禁言状态（T/F）",
+    "type": "bool",
+    "default": false,
+    "hint": "⚠️ 风险：开启后，其他 bot 对该用户的禁言状态会同步到本地，可能导致本地 bot 误禁言用户（例如 bot A 误判后，bot B 也禁言该用户）。仅在多个 bot 服务于同一用户群体、希望统一禁言时才开启。"
+  },
+  "enable_cloud_delete_record": {
+    "description": "子功能：删除云端记录",
+    "type": "bool",
+    "default": false,
+    "hint": "⚠️ 谨慎：开启后，可通过 API 或管理指令删除云端记录。需同时配置 cloud_admin_token。删除操作不可恢复，会被记录到服务端审计日志。"
+  },
+  "enable_cloud_upload_special": {
+    "description": "子功能：上传特殊记录",
+    "type": "bool",
+    "default": true,
+    "hint": "开启后，本地检测到的政治敏感/违法内容会同步上传到云端，便于多 bot 共享举报证据。"
+  }
+}
