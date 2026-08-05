@@ -1733,6 +1733,22 @@ class CheckMaliciousMessagePlugin(Star):
                 raw = e.read() or b"{}"
                 status = e.code
             except urllib.error.URLError as e:
+                msg = str(e)
+                # 识别 SSL 协议不匹配（通常是 cloud_server_url 协议与服务端不一致）
+                if "SSL" in msg or "WRONG_VERSION_NUMBER" in msg or "CERTIFICATE" in msg:
+                    srv = self._cloud_server_url()
+                    scheme = srv.split("://")[0].lower() if "://" in srv else ""
+                    hint = (
+                        f"SSL 错误：请检查 cloud_server_url 协议是否与服务端一致"
+                        f"（当前配置: {scheme}://）。服务端为 HTTP 时应使用 http://，"
+                        f"为 HTTPS 时应使用 https://。原始错误: {msg}"
+                    )
+                    raise RuntimeError(hint)
+                # 连接被拒绝（端口/防火墙）
+                if "Connection refused" in msg or "Connection refused" in str(getattr(e, "reason", "")):
+                    raise RuntimeError(
+                        f"连接被拒绝，请检查服务端是否启动、端口是否正确、防火墙是否放行。原始错误: {msg}"
+                    )
                 raise RuntimeError(f"网络错误: {e}")
             except Exception as e:
                 raise RuntimeError(f"请求失败: {e}")
@@ -2056,6 +2072,14 @@ class CheckMaliciousMessagePlugin(Star):
         if self._cloud_syncing:
             return {"ok": False, "error": "同步进行中，跳过本次"}
         self._cloud_syncing = True
+        # 在开始同步前更新 last_sync_ts，确保即使同步失败也能正确显示下次倒计时
+        # 仅当 last_sync_ts 为 0（首次同步）或已超过间隔时才更新
+        now = time.time()
+        last = float(self._cloud.get("last_sync_ts", 0) or 0)
+        interval = int(self.config.get("cloud_sync_interval", CLOUD_DEFAULT_INTERVAL) or CLOUD_DEFAULT_INTERVAL)
+        interval = max(30, interval)
+        if last <= 0 or now - last >= interval:
+            self._cloud["last_sync_ts"] = now
         try:
             # 1. 拉取（拉取本身不需要子开关，是否合并由 _cloud_apply_remote_records 控制）
             pull_result = await self._cloud_pull()
@@ -2450,6 +2474,8 @@ class CheckMaliciousMessagePlugin(Star):
     def _cloud_next_sync_seconds(self, cfg) -> int:
         if not self._cloud_enabled():
             return -1
+        if self._cloud_syncing:
+            return 0  # 正在同步中，下次同步在当前完成后立即触发
         try:
             interval = int(cfg.get("cloud_sync_interval", CLOUD_DEFAULT_INTERVAL) or CLOUD_DEFAULT_INTERVAL)
             interval = max(30, interval)

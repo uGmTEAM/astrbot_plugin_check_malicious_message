@@ -1,4 +1,4 @@
-{
+﻿{
   "enable": {
     "description": "是否启用恶意消息检测",
     "type": "bool",
@@ -195,7 +195,7 @@
     "description": "云服务端 URL",
     "type": "string",
     "default": "",
-    "hint": "例如 http://your-server:8765 或 https://cloud.example.com。需自建 cloud_server（详见插件目录下 cloud_server/README.md）。"
+    "hint": "例如 http://your-server:8765 或 https://cloud.example.com。需自建 cloud_server（详见插件目录下 cloud_server/README.md）。注意：协议必须与服务端实际协议一致——服务端为 HTTP 时用 http://，配置了 HTTPS 反向代理时用 https://，否则会触发 SSL 错误。"
   },
   "cloud_client_token": {
     "description": "云客户端 Token（上传/同步用）",

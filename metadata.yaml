@@ -4,5 +4,5 @@ desc: 调用大模型判断用户消息是否含有严重恶意（辱骂/人身�
 short_desc: 调用大模型实时检测消息是否含有严重恶意并发出警告，支持多 bot 云同步。
 author: uGmTEAM
 repo: ""
-version: 1.2.0
+version: 1.2.1
 astrbot_version: ">=4.5.7"
