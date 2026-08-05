@@ -252,6 +252,7 @@ class CheckMaliciousMessagePlugin(Star):
         # 云同步后台任务（仅在启用时实际工作）
         if self._cloud_task is None or self._cloud_task.done():
             self._cloud_task = asyncio.create_task(self._cloud_sync_loop())
+            logger.info("[恶意消息检测] 云同步后台任务已启动")
 
     async def terminate(self):
         """插件卸载 / 停用时调用。"""
@@ -2073,14 +2074,6 @@ class CheckMaliciousMessagePlugin(Star):
         if self._cloud_syncing:
             return {"ok": False, "error": "同步进行中，跳过本次"}
         self._cloud_syncing = True
-        # 在开始同步前更新 last_attempt_ts，确保即使同步失败也能正确显示下次倒计时
-        # 仅当 last_attempt_ts 为 0（首次同步）或已超过间隔时才更新
-        now = time.time()
-        last_attempt = float(self._cloud.get("last_attempt_ts", 0) or 0)
-        interval = int(self.config.get("cloud_sync_interval", CLOUD_DEFAULT_INTERVAL) or CLOUD_DEFAULT_INTERVAL)
-        interval = max(30, interval)
-        if last_attempt <= 0 or now - last_attempt >= interval:
-            self._cloud["last_attempt_ts"] = now
         try:
             # 1. 拉取（拉取本身不需要子开关，是否合并由 _cloud_apply_remote_records 控制）
             pull_result = await self._cloud_pull()
@@ -2120,7 +2113,7 @@ class CheckMaliciousMessagePlugin(Star):
         except Exception as e:
             self._cloud_record_error(f"full_sync: {e}")
             logger.warning(f"[恶意消息检测] 云同步异常: {e}")
-            # 同步失败也持久化 last_attempt_ts 和错误信息，避免重载后倒计时卡死
+            # 持久化错误信息
             self._save()
             return {"ok": False, "error": str(e)}
         finally:
@@ -2149,6 +2142,12 @@ class CheckMaliciousMessagePlugin(Star):
                 next_fire = last + interval
                 if next_fire <= now:
                     # 已到期（可能是重载前就该同步了），立即执行
+                    # ★ 在调用 _cloud_full_sync 之前更新 last_attempt_ts
+                    #   确保即使 _cloud_full_sync 早返回（云未启用/同步中），
+                    #   也不会死循环（与 _do_decrement 无条件更新 last_decrement 一致）
+                    self._cloud["last_attempt_ts"] = now
+                    self._save()
+                    logger.info(f"[恶意消息检测] 云同步循环触发: attempt_at={self._fmt_ts(now)}, next_fire={next_fire}")
                     await self._cloud_full_sync()
                     continue  # 继续循环，重新计算下一次
                 # 等到下次同步时刻
