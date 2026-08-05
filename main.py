@@ -2127,19 +2127,39 @@ class CheckMaliciousMessagePlugin(Star):
             self._cloud_syncing = False
 
     async def _cloud_sync_loop(self):
-        """云同步后台任务：按 interval 周期性同步。"""
+        """云同步后台任务：按 interval 周期性同步（与衰减任务相同的绝对时间点调度模式）。
+
+        逻辑：
+        - 每次同步后记录 last_attempt_ts = now
+        - 下一次同步时间 = last_attempt_ts + interval
+        - 若当前已超过下次同步时间（如停机期间错过了），立即执行
+        - 使用分段 sleep 避免一次 sleep 过长无法及时响应
+        """
         # 启动后稍等
         await asyncio.sleep(15)
         while True:
             try:
-                if self._cloud_enabled():
-                    interval = int(self.config.get("cloud_sync_interval", CLOUD_DEFAULT_INTERVAL) or CLOUD_DEFAULT_INTERVAL)
-                    interval = max(30, interval)
-                    last = float(self._cloud.get("last_attempt_ts", 0) or 0)
-                    if time.time() - last >= interval:
-                        await self._cloud_full_sync()
-                # 短睡眠以便及时响应取消
-                await asyncio.sleep(30)
+                if not self._cloud_enabled():
+                    await asyncio.sleep(30)
+                    continue
+                interval = int(self.config.get("cloud_sync_interval", CLOUD_DEFAULT_INTERVAL) or CLOUD_DEFAULT_INTERVAL)
+                interval = max(30, interval)
+                now = time.time()
+                last = float(self._cloud.get("last_attempt_ts", 0) or 0)
+                next_fire = last + interval
+                if next_fire <= now:
+                    # 已到期（可能是重载前就该同步了），立即执行
+                    await self._cloud_full_sync()
+                    continue  # 继续循环，重新计算下一次
+                # 等到下次同步时刻
+                wait = next_fire - time.time()
+                # 分段等待，避免一次 sleep 过长无法及时响应
+                while wait > 0:
+                    chunk = min(wait, 60)
+                    await asyncio.sleep(chunk)
+                    wait -= chunk
+                    if time.time() >= next_fire:
+                        break
             except asyncio.CancelledError:
                 raise
             except Exception as e:
