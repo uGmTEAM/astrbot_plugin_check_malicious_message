@@ -1,0 +1,155 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>恶意消息警告统计</title>
+    <link rel="stylesheet" href="./style.css" />
+  </head>
+  <body>
+    <header class="topbar">
+      <div class="title">
+        <span class="logo">🛡️</span>
+        <h1>恶意消息警告统计</h1>
+      </div>
+      <div class="actions">
+        <label class="auto">
+          <input id="autoRefresh" type="checkbox" checked />
+          自动刷新（5s）
+        </label>
+        <button id="refresh" class="btn">立即刷新</button>
+      </div>
+    </header>
+
+    <nav class="tabs">
+      <button class="tab active" data-tab="stats">警告次数统计</button>
+      <button class="tab" data-tab="logs">被警告消息备案</button>
+      <button class="tab" data-tab="special">特殊记录</button>
+      <button class="tab" data-tab="timeout">超时记录</button>
+      <button class="tab" data-tab="cloud">☁️ 云同步</button>
+    </nav>
+
+    <section class="summary" id="summary">加载中…</section>
+
+    <!-- Tab: 统计 -->
+    <section id="pane-stats" class="pane">
+      <div class="table-wrap">
+        <table id="table">
+          <thead>
+            <tr>
+              <th>#</th>
+              <th>用户</th>
+              <th>平台</th>
+              <th class="num">当前 x</th>
+              <th class="num">累计</th>
+              <th>最近警告原因</th>
+              <th>最近警告时间</th>
+              <th>状态</th>
+              <th>操作</th>
+            </tr>
+          </thead>
+          <tbody id="tbody"></tbody>
+        </table>
+      </div>
+      <p class="empty" id="empty" hidden>暂无警告记录。</p>
+    </section>
+
+    <!-- Tab: 备案 -->
+    <section id="pane-logs" class="pane" hidden>
+      <div class="table-wrap">
+        <table id="logTable">
+          <thead>
+            <tr>
+              <th>#</th>
+              <th>时间</th>
+              <th>用户</th>
+              <th>平台/群</th>
+              <th>被警告消息</th>
+              <th>判定原因</th>
+              <th class="num">x</th>
+              <th>禁言</th>
+            </tr>
+          </thead>
+          <tbody id="logTbody"></tbody>
+        </table>
+      </div>
+      <p class="empty" id="logEmpty" hidden>暂无被警告消息备案。</p>
+    </section>
+
+    <!-- Tab: 特殊记录 -->
+    <section id="pane-special" class="pane" hidden>
+      <div class="summary" id="specialSummary">加载中…</div>
+      <div class="table-wrap">
+        <table id="specialTable">
+          <thead>
+            <tr>
+              <th>#</th>
+              <th>时间</th>
+              <th>用户</th>
+              <th>分类</th>
+              <th>平台/群</th>
+              <th>消息内容</th>
+              <th>特殊原因</th>
+              <th>操作</th>
+            </tr>
+          </thead>
+          <tbody id="specialTbody"></tbody>
+        </table>
+      </div>
+      <p class="empty" id="specialEmpty" hidden>暂无特殊记录。</p>
+    </section>
+
+    <!-- Tab: 超时记录 -->
+    <section id="pane-timeout" class="pane" hidden>
+      <div class="summary" id="timeoutSummary">加载中…</div>
+      <div class="table-wrap">
+        <table id="timeoutTable">
+          <thead>
+            <tr>
+              <th>#</th>
+              <th>原时间</th>
+              <th>归档时间</th>
+              <th>用户</th>
+              <th>平台/群</th>
+              <th>消息内容</th>
+              <th>判定原因</th>
+            </tr>
+          </thead>
+          <tbody id="timeoutTbody"></tbody>
+        </table>
+      </div>
+      <p class="empty" id="timeoutEmpty" hidden>暂无超时记录。</p>
+    </section>
+
+    <!-- Tab: 云同步 -->
+    <section id="pane-cloud" class="pane" hidden>
+      <div class="summary" id="cloudSummary">加载中…</div>
+      <div class="cloud-actions">
+        <button id="cloudSyncBtn" class="btn">🔄 立即同步</button>
+        <button id="cloudUploadBtn" class="btn">📤 上传本地记录</button>
+        <button id="cloudUploadSpecialBtn" class="btn">📤 上传特殊记录</button>
+        <button id="cloudRefreshBtn" class="btn">🔁 刷新状态</button>
+      </div>
+      <div class="table-wrap">
+        <table id="cloudTable">
+          <thead>
+            <tr>
+              <th>#</th>
+              <th>用户</th>
+              <th>平台</th>
+              <th class="num">云端 x</th>
+              <th class="num">云端累计</th>
+              <th>禁言状态</th>
+              <th>最近警告</th>
+              <th>来源 bot</th>
+            </tr>
+          </thead>
+          <tbody id="cloudTbody"></tbody>
+        </table>
+      </div>
+      <p class="empty" id="cloudEmpty" hidden>云端暂无记录，或云同步未启用。</p>
+    </section>
+
+    <script type="module" src="./app.js"></script>
+  </body>
+</html>
