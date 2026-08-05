@@ -50,6 +50,7 @@ SPECIAL_RECORDS: list[dict] = []
 META: dict = {"created_at": 0, "last_seq": 0}
 DATA_DIR = "data"
 LOG_DIR = "logs"
+BLACKLIST: list[str] = []  # IP 黑名单（支持精确匹配和 CIDR 前缀，如 192.168.1.）
 
 
 # ---------------------------------------------------------------------------
@@ -66,6 +67,23 @@ def now_str() -> str:
 
 def record_key(platform_id: str, user_id: str) -> str:
     return f"{platform_id or ''}:{user_id or ''}"
+
+
+def _special_fingerprint(item: dict, default_bot_id: str = "") -> str:
+    """为特殊记录生成去重指纹。基于 (cloud_bot_id, user_id, platform_id, time, message)。
+
+    返回空字符串表示无法生成有效指纹（跳过该记录的去重检查）。
+    """
+    if not isinstance(item, dict):
+        return ""
+    bot_id = str(item.get("cloud_bot_id", "") or default_bot_id or "")
+    uid = str(item.get("user_id", "") or "")
+    pid = str(item.get("platform_id", "") or "")
+    msg = str(item.get("message", "") or "")[:200]
+    t = float(item.get("time", 0) or 0)
+    if not uid or t <= 0:
+        return ""
+    return f"{bot_id}|{pid}|{uid}|{t}|{msg}"
 
 
 def atomic_write(path: str, data) -> None:
@@ -225,6 +243,58 @@ def save_special() -> None:
     os.makedirs(DATA_DIR, exist_ok=True)
     data = {"special_records": SPECIAL_RECORDS, "meta": {"updated_at": now_ts()}}
     atomic_write(special_path(), data)
+
+
+# ---- IP 黑名单 ----
+
+BLACKLIST_FILE = "blacklist.json"
+BLACKLISTED_RESPONSE_TEXT = "你的IP已被拉黑，无法访问此服务。"
+
+
+def blacklist_path() -> str:
+    return os.path.join(DATA_DIR, BLACKLIST_FILE)
+
+
+def load_blacklist() -> None:
+    global BLACKLIST
+    try:
+        if os.path.exists(blacklist_path()):
+            with open(blacklist_path(), "r", encoding="utf-8") as f:
+                data = json.load(f)
+            BLACKLIST = data.get("blacklist", []) or []
+        else:
+            BLACKLIST = []
+    except Exception as e:
+        sys.stderr.write(f"[load blacklist] 失败: {e}\n")
+        BLACKLIST = []
+
+
+def save_blacklist() -> None:
+    os.makedirs(DATA_DIR, exist_ok=True)
+    data = {"blacklist": BLACKLIST, "updated_at": now_ts()}
+    atomic_write(blacklist_path(), data)
+
+
+def is_ip_blacklisted(ip: str) -> bool:
+    """检查 IP 是否被拉黑。支持精确匹配和前缀匹配（如 192.168.1.）。"""
+    if not ip:
+        return False
+    for pattern in BLACKLIST:
+        if not pattern:
+            continue
+        if ip == pattern:
+            return True
+        if pattern.endswith(".") and ip.startswith(pattern):
+            return True
+        if "/" in pattern:
+            # 简单 CIDR 前缀匹配
+            try:
+                prefix = pattern.rsplit(".", 1)[0]  # e.g., "192.168.1"
+                if ip.startswith(prefix + "."):
+                    return True
+            except Exception:
+                pass
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -524,12 +594,32 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def _check_blacklist(self) -> bool:
+        """检查客户端 IP 是否在黑名单中。若被拉黑则返回 True 并发送响应。
+
+        注意：健康检查端点（/api/health）不拉黑，避免影响负载均衡。
+        """
+        ip = self.client_address[0] if self.client_address else ""
+        path = self.path or ""
+        # 健康检查不拉黑
+        if path.startswith("/api/health"):
+            return False
+        if ip and is_ip_blacklisted(ip):
+            log_request("*", path, 403, ip, "blocked by blacklist")
+            self._send_simple(403, BLACKLISTED_RESPONSE_TEXT)
+            return True
+        return False
+
     # ---- 路由分发 ----
     def do_OPTIONS(self):  # noqa: N802
         self._send_json(HTTPStatus.OK, {"ok": True, "method": "OPTIONS"})
 
     def do_GET(self):  # noqa: N802
         try:
+            # ---- IP 黑名单检查 ----
+            if self._check_blacklist():
+                return
+
             parsed = urlparse(self.path)
             path = parsed.path.rstrip("/") or "/"
             qs = parse_qs(parsed.query)
@@ -587,6 +677,12 @@ class Handler(BaseHTTPRequestHandler):
                     log_request("GET", path, 401, self.client_address[0])
                     return self._send_error_json(HTTPStatus.UNAUTHORIZED, "invalid admin token")
                 return self._handle_request_log(qs)
+            if path == "/api/blacklist":
+                # 获取黑名单（admin_token）
+                if not self._check_admin_token():
+                    log_request("GET", path, 401, self.client_address[0])
+                    return self._send_error_json(HTTPStatus.UNAUTHORIZED, "invalid admin token")
+                return self._handle_blacklist_list()
             log_request("GET", path, 404, self.client_address[0])
             return self._send_error_json(HTTPStatus.NOT_FOUND, "not found")
         except Exception as e:
@@ -595,6 +691,10 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):  # noqa: N802
         try:
+            # ---- IP 黑名单检查 ----
+            if self._check_blacklist():
+                return
+
             parsed = urlparse(self.path)
             path = parsed.path.rstrip("/") or "/"
 
@@ -627,6 +727,24 @@ class Handler(BaseHTTPRequestHandler):
                     log_request("POST", path, 401, self.client_address[0])
                     return self._send_error_json(HTTPStatus.UNAUTHORIZED, "invalid client token")
                 return self._handle_revoke_record()
+            if path == "/api/dedup":
+                # 手动去重：仅 admin_token
+                if not self._check_admin_token():
+                    log_request("POST", path, 401, self.client_address[0])
+                    return self._send_error_json(HTTPStatus.UNAUTHORIZED, "invalid admin token")
+                return self._handle_dedup()
+            if path == "/api/blacklist/add":
+                # 添加黑名单（admin_token）
+                if not self._check_admin_token():
+                    log_request("POST", path, 401, self.client_address[0])
+                    return self._send_error_json(HTTPStatus.UNAUTHORIZED, "invalid admin token")
+                return self._handle_blacklist_add()
+            if path == "/api/blacklist/remove":
+                # 移除黑名单（admin_token）
+                if not self._check_admin_token():
+                    log_request("POST", path, 401, self.client_address[0])
+                    return self._send_error_json(HTTPStatus.UNAUTHORIZED, "invalid admin token")
+                return self._handle_blacklist_remove()
             log_request("POST", path, 404, self.client_address[0])
             return self._send_error_json(HTTPStatus.NOT_FOUND, "not found")
         except Exception as e:
@@ -723,10 +841,17 @@ class Handler(BaseHTTPRequestHandler):
                     skipped += 1
                     continue
                 k = record_key(pid, uid)
+                # ★ 去重：若服务端已存在相同 key 且 last_warned 一致，跳过（以服务器为准）
+                existing = RECORDS.get(k)
+                if existing is not None:
+                    incoming_lw = float(item.get("last_warned", 0) or 0)
+                    existing_lw = float(existing.get("last_warned", 0) or 0)
+                    if incoming_lw > 0 and incoming_lw == existing_lw:
+                        skipped += 1
+                        continue
                 merge_record(k, item, bot_id)
                 uploaded += 1
                 if len(RECORDS) > max_size:
-                    # 超出上限：淘汰 count=0 且未禁言的最旧记录
                     _evict_old_records(max_size)
             save_records()
         result = {"ok": True, "uploaded": uploaded, "skipped": skipped, "total_cloud": len(RECORDS)}
@@ -747,21 +872,36 @@ class Handler(BaseHTTPRequestHandler):
         max_special = int(CONFIG.get("max_special_records", 10000))
         with LOCK:
             uploaded = 0
+            skipped = 0
+            # ★ 预建索引：基于 (cloud_bot_id, user_id, platform_id, time, message) 去重
+            existing_fingerprints = set()
+            for s in SPECIAL_RECORDS:
+                fp = _special_fingerprint(s)
+                if fp:
+                    existing_fingerprints.add(fp)
             for item in records:
                 if not isinstance(item, dict):
+                    skipped += 1
+                    continue
+                # ★ 去重：若指纹已存在则跳过
+                incoming_fp = _special_fingerprint(item, bot_id)
+                if incoming_fp and incoming_fp in existing_fingerprints:
+                    skipped += 1
                     continue
                 item.setdefault("time", now_ts())
                 item.setdefault("time_str", now_str())
                 item["cloud_bot_id"] = bot_id
                 item["cloud_seq"] = next_seq()
                 SPECIAL_RECORDS.append(item)
+                if incoming_fp:
+                    existing_fingerprints.add(incoming_fp)
                 uploaded += 1
             if len(SPECIAL_RECORDS) > max_special:
                 SPECIAL_RECORDS[:] = SPECIAL_RECORDS[-max_special:]
             save_special()
-        result = {"ok": True, "uploaded": uploaded, "total_cloud": len(SPECIAL_RECORDS)}
-        audit_log("upload_special", bot_id, {"uploaded": uploaded})
-        log_request("POST", "/api/upload_special", 200, self.client_address[0], f"uploaded={uploaded}")
+        result = {"ok": True, "uploaded": uploaded, "skipped": skipped, "total_cloud": len(SPECIAL_RECORDS)}
+        audit_log("upload_special", bot_id, {"uploaded": uploaded, "skipped": skipped})
+        log_request("POST", "/api/upload_special", 200, self.client_address[0], f"uploaded={uploaded}, skipped={skipped}")
         return self._send_json(HTTPStatus.OK, result)
 
     def _handle_get_sync(self, qs):
@@ -789,15 +929,26 @@ class Handler(BaseHTTPRequestHandler):
         records = body.get("records")
         with LOCK:
             uploaded = 0
+            skipped = 0
             if isinstance(records, list):
                 for item in records:
                     if not isinstance(item, dict):
+                        skipped += 1
                         continue
                     uid = str(item.get("user_id", ""))
                     pid = str(item.get("platform_id", ""))
                     if not uid:
+                        skipped += 1
                         continue
                     k = record_key(pid, uid)
+                    # ★ 去重：若服务端已存在相同 key 且 last_warned 一致，跳过
+                    existing = RECORDS.get(k)
+                    if existing is not None:
+                        incoming_lw = float(item.get("last_warned", 0) or 0)
+                        existing_lw = float(existing.get("last_warned", 0) or 0)
+                        if incoming_lw > 0 and incoming_lw == existing_lw:
+                            skipped += 1
+                            continue
                     merge_record(k, item, bot_id)
                     uploaded += 1
             result = apply_incremental(updates, bot_id)
@@ -805,15 +956,16 @@ class Handler(BaseHTTPRequestHandler):
         resp = {
             "ok": True,
             "uploaded": uploaded,
+            "records_skipped": skipped,
             "applied": result["applied"],
             "skipped": result["skipped"],
             "details": result["details"][:200],
             "total_cloud": len(RECORDS),
             "server_time": now_ts(),
         }
-        audit_log("post_sync", bot_id, {"uploaded": uploaded, "applied": result["applied"]})
+        audit_log("post_sync", bot_id, {"uploaded": uploaded, "records_skipped": skipped, "applied": result["applied"]})
         log_request("POST", "/api/sync", 200, self.client_address[0],
-                    f"applied={result['applied']}")
+                    f"uploaded={uploaded}, records_skipped={skipped}, applied={result['applied']}")
         return self._send_json(HTTPStatus.OK, resp)
 
     def _handle_delete_record(self):
@@ -947,6 +1099,124 @@ class Handler(BaseHTTPRequestHandler):
             "new_count": new_count,
         })
 
+    def _handle_dedup(self):
+        """手动去重：支持 records 和 special 两种类型。
+
+        - records: 清理 count=0、未禁言、last_warned 超过 30 天的僵尸记录
+        - special: 按指纹去重，保留首次出现，移除后续重复项（不删除非重复记录）
+        """
+        body, err = self._read_body()
+        if err:
+            return self._send_error_json(HTTPStatus.BAD_REQUEST, f"invalid body: {err}")
+        bot_id = str(body.get("bot_id", "admin")) or "admin"
+        dedup_type = str(body.get("type", "") or "")
+
+        result = {"ok": True, "records": {}, "special": {}}
+
+        with LOCK:
+            # ---- 普通记录去重 ----
+            if dedup_type in ("", "records"):
+                now = time.time()
+                stale_threshold = 30 * 86400  # 30 天
+                removed_records = []
+                for k, rec in list(RECORDS.items()):
+                    count = int(rec.get("count", 0) or 0)
+                    is_muted = bool(rec.get("is_muted", False))
+                    last_warned = float(rec.get("last_warned", 0) or 0)
+                    # 僵尸记录判定：count=0 且未禁言 且 last_warned 已过期
+                    if count <= 0 and not is_muted and (now - last_warned) > stale_threshold:
+                        removed_records.append({
+                            "key": k,
+                            "user_id": rec.get("user_id", ""),
+                            "count": count,
+                            "is_muted": is_muted,
+                            "last_warned": last_warned,
+                        })
+                        del RECORDS[k]
+                if removed_records:
+                    save_records()
+                result["records"] = {
+                    "removed": len(removed_records),
+                    "total_before": len(RECORDS) + len(removed_records),
+                    "total_after": len(RECORDS),
+                }
+
+            # ---- 特殊记录去重 ----
+            if dedup_type in ("", "special"):
+                seen_fps = set()
+                kept = []
+                removed_special = 0
+                for item in SPECIAL_RECORDS:
+                    fp = _special_fingerprint(item)
+                    if fp and fp in seen_fps:
+                        removed_special += 1
+                        continue
+                    if fp:
+                        seen_fps.add(fp)
+                    kept.append(item)
+                if removed_special > 0:
+                    SPECIAL_RECORDS[:] = kept
+                    save_special()
+                result["special"] = {
+                    "removed": removed_special,
+                    "total_before": len(SPECIAL_RECORDS) + removed_special,
+                    "total_after": len(SPECIAL_RECORDS),
+                }
+
+        # 清理空的 result 字段
+        if dedup_type == "records":
+            del result["special"]
+        elif dedup_type == "special":
+            del result["records"]
+
+        audit_log("dedup", bot_id, result)
+        log_request("POST", "/api/dedup", 200, self.client_address[0],
+                    f"type={dedup_type} records_removed={result.get('records', {}).get('removed', 0)} special_removed={result.get('special', {}).get('removed', 0)}")
+        return self._send_json(HTTPStatus.OK, result)
+
+    # ---- IP 黑名单管理 ----
+
+    def _handle_blacklist_list(self):
+        """获取当前黑名单列表。"""
+        with LOCK:
+            items = list(BLACKLIST)
+        log_request("GET", "/api/blacklist", 200, self.client_address[0])
+        return self._send_json(HTTPStatus.OK, {"ok": True, "items": items, "total": len(items)})
+
+    def _handle_blacklist_add(self):
+        """添加 IP 到黑名单。body: {"ip": "192.168.1.1"}"""
+        body, err = self._read_body()
+        if err:
+            return self._send_error_json(HTTPStatus.BAD_REQUEST, f"invalid body: {err}")
+        ip = str(body.get("ip", "") or "").strip()
+        if not ip:
+            return self._send_error_json(HTTPStatus.BAD_REQUEST, "缺少 ip 参数")
+        with LOCK:
+            if ip not in BLACKLIST:
+                BLACKLIST.append(ip)
+                save_blacklist()
+                audit_log("blacklist_add", self.client_address[0], {"ip": ip})
+        log_request("POST", "/api/blacklist/add", 200, self.client_address[0], f"ip={ip}")
+        return self._send_json(HTTPStatus.OK, {"ok": True, "ip": ip, "added": True})
+
+    def _handle_blacklist_remove(self):
+        """从黑名单移除 IP。body: {"ip": "192.168.1.1"}"""
+        body, err = self._read_body()
+        if err:
+            return self._send_error_json(HTTPStatus.BAD_REQUEST, f"invalid body: {err}")
+        ip = str(body.get("ip", "") or "").strip()
+        if not ip:
+            return self._send_error_json(HTTPStatus.BAD_REQUEST, "缺少 ip 参数")
+        removed = False
+        with LOCK:
+            if ip in BLACKLIST:
+                BLACKLIST.remove(ip)
+                save_blacklist()
+                removed = True
+                audit_log("blacklist_remove", self.client_address[0], {"ip": ip})
+        log_request("POST", "/api/blacklist/remove", 200, self.client_address[0], f"ip={ip}")
+        return self._send_json(HTTPStatus.OK, {"ok": True, "ip": ip, "removed": removed})
+
     def _handle_audit_log(self, qs):
         try:
             limit = int(qs.get("limit", ["500"])[0])
@@ -1033,6 +1303,7 @@ def main():
         )
 
     load_data()
+    load_blacklist()
     if not META.get("created_at"):
         META["created_at"] = now_ts()
         save_records()
