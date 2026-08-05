@@ -99,8 +99,8 @@ function escapeHtml(s) {
     .replace(/"/g, "&quot;");
 }
 
-function fmtCountdown(sec) {
-  if (sec <= 0) return "即将衰减";
+function fmtCountdown(sec, justText = "即将") {
+  if (sec <= 0) return justText;
   const h = Math.floor(sec / 3600);
   const m = Math.floor((sec % 3600) / 60);
   const s = sec % 60;
@@ -128,7 +128,7 @@ async function loadStats() {
       `共 <b>${total}</b> 人有警告记录 · ` +
       `x&gt;5（已触发禁言阈值）<b>${highCount}</b> 人 · ` +
       `当前禁言中 <b>${mutedCount}</b> 人` +
-      (decay !== null ? ` · 距下次全局衰减：${fmtCountdown(decay)}` : "");
+      (decay !== null ? ` · 距下次全局衰减：${fmtCountdown(decay, "即将衰减")}` : "");
 
     if (items.length === 0) {
       tbody.innerHTML = "";
@@ -185,6 +185,7 @@ async function loadLogs() {
 
     logTbody.innerHTML = items
       .map((r, i) => {
+        const isRevoked = !!r.revoked;
         const mutedTag = r.muted
           ? `<span class="badge muted">禁言 ${escapeHtml(r.mute_minutes || 0)} 分钟</span>`
           : '<span class="badge zero">未禁言</span>';
@@ -193,21 +194,31 @@ async function loadLogs() {
           : `${escapeHtml(r.platform || "-")} · 群 ${escapeHtml(r.group_id || "-")}`;
         const adminTag = r.is_admin ? ' <span class="badge admin">管理员</span>' : "";
         const logId = escapeHtml(r.log_id || "");
-        return `<tr>
+        // 已撤回标记 + 撤回理由（鼠标悬停查看）
+        const revokedTag = isRevoked
+          ? ` <span class="badge revoked" title="${escapeHtml(r.revoke_reason || "")}">已撤回</span>`
+          : "";
+        const revokeReasonCell = isRevoked
+          ? `<div class="revoke-reason" title="${escapeHtml(r.revoke_reason || "")}">撤回理由：${escapeHtml(r.revoke_reason || "-")}</div>`
+          : "";
+        // 已撤回的记录显示撤回时间，撤回按钮禁用
+        const revokeBtn = isRevoked
+          ? `<button class="btn small" disabled>已撤回</button>`
+          : `<button class="btn small danger" data-log-id="${logId}" data-action="revoke">撤回</button>`;
+        const rowClass = isRevoked ? ' class="revoked-row"' : "";
+        return `<tr${rowClass}>
           <td>${i + 1}</td>
-          <td>${escapeHtml(r.time_str || "-")}</td>
+          <td>${escapeHtml(r.time_str || "-")}${revokedTag}</td>
           <td>
             <div class="user">${escapeHtml(r.sender_name || r.user_id || "未知")}${adminTag}</div>
             <div class="uid">UID: ${escapeHtml(r.user_id || "-")}</div>
           </td>
           <td>${scope}</td>
           <td class="msg" title="${escapeHtml(r.message)}">${escapeHtml(r.message || "-")}</td>
-          <td class="reason" title="${escapeHtml(r.reason)}">${escapeHtml(r.reason || "-")}</td>
+          <td class="reason" title="${escapeHtml(r.reason)}">${escapeHtml(r.reason || "-")}${revokeReasonCell}</td>
           <td class="num"><span class="badge low">${r.count}</span></td>
           <td>${mutedTag}</td>
-          <td>
-            <button class="btn small danger" data-log-id="${logId}" data-action="revoke">撤回</button>
-          </td>
+          <td>${revokeBtn}</td>
         </tr>`;
       })
       .join("");
