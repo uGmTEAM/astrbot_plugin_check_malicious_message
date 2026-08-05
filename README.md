@@ -15,6 +15,8 @@
 - **特殊记录**：政治敏感/违法内容单独归档，按人分类以便举报；
 - **超时记录**：标准备案记录超 7 天自动归档，可一键清理；
 - **☁️ 多 bot 云同步**：自建云服务端后，多个 bot 可共享警告记录、禁言状态与特殊记录；
+- **↩️ 误判撤回**：被警告消息备案页可一键撤回误判警告，自动递减 count 并标记消息以免再次误判，同时向云端发送撤回请求（需 bot_id 一致）；
+- **🖥️ 云端可视化管理器**：浏览器访问服务端地址即可进入管理后台，查看记录、特殊记录、审计日志、请求日志；
 - 通过 **插件页面**实时展示每个人的 x 次数。
 
 ## 功能特性
@@ -35,6 +37,7 @@
 - 🔴 **特殊记录**：政治敏感/违法内容单独归档，按人分类，支持一键复制以便举报。
 - 📦 **超时归档**：标准备案记录超过 7 天自动转移至超时记录页面，可一键清理。
 - 📋 **每日总结**：每日自动生成统计总结（警告次数、涉及人数、禁言次数、Top 10 用户）。
+- ↩️ **误判撤回**：被警告消息备案页可一键撤回误判，自动递减 count、标记消息以免再次误判、向云端发送撤回请求。
 - ⚙️ **白名单指令**：通过指令动态增删群白名单，持久化到配置文件。
 - ⚠️ **事件拦截**：可选拦截事件传播，阻止机器人对恶意消息做 LLM 回复。
 - 🎛️ **精细控制**：私聊/群聊开关、指令跳过、长度过滤、用户与群聊白名单。
@@ -153,6 +156,13 @@ AstrBot/data/plugins/astrbot_plugin_check_malicious_message/
 | `enable_cloud_sync_mute` | `false` | ⚠️ **误禁言风险**：其他 bot 对该用户的禁言状态会同步到本地，可能导致本地 bot 误禁言用户 |
 | `enable_cloud_delete_record` | `false` | ⚠️ 谨慎：可通过 API/指令删除云端记录，需 admin_token，操作不可恢复（记入审计日志） |
 | `enable_cloud_upload_special` | `true` | 相对安全：本地特殊记录上传到云端，便于多 bot 共享举报证据 |
+| `enable_cloud_revoke` | `true` | 相对安全：本地撤回误判警告时自动向云端发送撤回请求，服务端校验 bot_id 一致才撤回 |
+
+### 误判撤回
+
+| 配置项 | 默认值 | 说明 |
+| --- | --- | --- |
+| `enable_false_positive_skip` | `true` | 被标记为误判的消息（精确+归一化匹配）在检测前会被跳过，避免再次误判 |
 
 ## 工作流程
 
@@ -343,9 +353,25 @@ LLM 可通过以下 Web API 自助调用云同步功能（AstrBot 自动转发�
 | POST | `cloud/upload_special` | Dashboard | 上传特殊记录（body: `{"limit": 100}`） |
 | POST | `cloud/sync` | Dashboard | 执行一次完整同步（拉取+推送） |
 | POST | `cloud/delete_record` | Dashboard | 删除云端记录（body: `{"keys": [...]}`，需 admin_token + 子开关） |
+| POST | `cloud/revoke_record` | Dashboard | 向云端发送误判撤回请求（body: `{"record_key","log_id","message","reason"}`，需 bot_id 一致） |
 | GET | `cloud/records` | Dashboard | 查询云端记录列表 |
+| POST | `revoke` | Dashboard | 本地撤回误判警告（body: `{"log_id","reason"}`，递减 count 并标记以免再次误判） |
+| GET | `false_positives` | Dashboard | 查询误判撤回记录列表 |
 
 > 调用路径：`POST /api/v1/plugins/extensions/astrbot_plugin_check_malicious_message/cloud/sync`。
+
+### ☁️ Web 可视化管理器
+
+浏览器访问服务端地址（如 `http://your-server:8765/`）即可进入管理后台：
+
+1. **无 Token 自动进入登录页**，输入 `admin_token` 登录；
+2. **📊 概览**：记录总数、特殊记录数、禁言中用户、高风险用户、贡献 Bot 列表、运行时长；
+3. **📋 警告记录**：搜索（UID/用户名/平台）、批量删除（复选框）、单条删除；
+4. **🔴 特殊记录**：按人分类查看政治敏感/违法内容；
+5. **📝 审计日志**：查看最近 500 条审计记录（撤回/删除/登录/上传/同步等操作）；
+6. **🌐 请求日志**：查看最近 500 条 HTTP 请求记录（方法/路径/状态/客户端）。
+
+管理器前端文件位于 `cloud_server/web/`（`index.html` / `app.js` / `style.css`），由服务端自动提供，无需额外配置。
 
 ### ⚠️ 风险提示
 
@@ -401,7 +427,11 @@ astrbot_plugin_check_malicious_message/
 │   ├── start.sh / stop.sh  # 启停脚本
 │   ├── malicious-cloud.service  # systemd 服务文件
 │   ├── requirements.txt    # 依赖说明（无第三方依赖）
-│   └── README.md           # 服务端部署文档
+│   ├── README.md           # 服务端部署文档
+│   └── web/                # 🖥️ Web 可视化管理器前端
+│       ├── index.html      # 登录页 + 仪表盘
+│       ├── app.js          # 管理器逻辑
+│       └── style.css       # 管理器样式
 ├── CHANGELOG.md            # 更新日志
 ├── README.md
 └── warning_data.json       # 运行时自动生成，保存警告记录与云同步状态

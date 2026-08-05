@@ -1,5 +1,34 @@
 # 更新日志
 
+## v1.2.0 — 2026-08-05
+
+### 新增功能
+
+- **误判撤回（本地 + 云端）**：被警告消息备案页面新增「撤回」按钮，可将误判警告撤回：
+  - **本地撤回**：根据 `log_id` 找到备案记录，将该用户 `count` -1（不低于 0，`total` 不变保留审计），标记日志为 `revoked`；
+  - **误判标记**：将被撤回的消息 + 误判理由加入 `_false_positives` 列表，检测前自动跳过匹配消息（精确 + 归一化匹配），避免再次误判；
+  - **云端撤回**：如启用云同步误判撤回（`enable_cloud_revoke`），本地撤回时自动向云端发送撤回请求，服务端校验 `bot_id` 必须在该记录的 `sources` 中才会撤回（仅上传该警告的 bot 才能撤回）；
+  - 新增 API：`POST /revoke`（本地撤回）、`GET /false_positives`（误判列表）、`POST /cloud/revoke_record`（云端撤回）；
+  - 新增配置项：`enable_false_positive_skip`（默认开启）、`enable_cloud_revoke`（默认开启）；
+  - 每条备案记录新增 `log_id` 字段（UUID），旧数据加载时自动补填。
+
+- **☁️ 云同步 Web 可视化管理器**：在 `cloud_server/web/` 新增管理器前端，浏览器访问服务端地址即可进入：
+  - **无 Token 自动进入登录页**，需输入 `admin_token` 登录；
+  - **📊 概览**：记录总数、特殊记录数、禁言中用户、高风险用户、贡献 Bot 列表、运行时长；
+  - **📋 警告记录**：搜索（UID/用户名/平台）、批量删除（复选框）、单条删除；
+  - **🔴 特殊记录**：按人分类查看政治敏感/违法内容；
+  - **📝 审计日志**：查看最近 500 条审计记录（撤回/删除/登录/上传/同步等操作）；
+  - **🌐 请求日志**：查看最近 500 条 HTTP 请求记录（方法/路径/状态/客户端）；
+  - 服务端新增端点：`POST /api/auth`（登录）、`GET /api/auth_check`（校验）、`GET /api/audit_log`、`GET /api/request_log`、`POST /api/revoke_record`；
+  - 读端点（records/special/stats）现接受 `client_token` 或 `admin_token`，便于管理器访问。
+
+### 修复
+
+- **按键失效**：修复插件页所有操作按钮（重置/撤回/清理/云同步等）在 AstrBot 沙箱 iframe 中无响应的问题。
+  - 根因：iframe 沙箱阻止 `alert()` / `confirm()` / `prompt()`，导致所有以确认对话框开头的按钮事件立即中止；
+  - 修复：用自定义 **toast 提示**（屏幕中间正上方，持续 3 秒，支持 info/ok/error 三种类型）替代 `alert()`；用自定义 **asyncConfirm 模态框** + **asyncPrompt 输入框** 替代 `confirm()` / `prompt()`；
+  - 「立即刷新」按钮因不使用确认对话框而一直正常，进一步验证了根因。
+
 ## v1.1.0 — 2026-08-04
 
 ### 新增功能

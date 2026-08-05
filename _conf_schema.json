@@ -250,5 +250,17 @@
     "type": "bool",
     "default": true,
     "hint": "开启后，本地检测到的政治敏感/违法内容会同步上传到云端，便于多 bot 共享举报证据。"
+  },
+  "enable_cloud_revoke": {
+    "description": "子功能：云端误判撤回",
+    "type": "bool",
+    "default": true,
+    "hint": "开启后，本地撤回误判警告时会自动向云端发送撤回请求。服务端校验 bot_id 必须与上传该警告的 bot 一致才会撤回。"
+  },
+  "enable_false_positive_skip": {
+    "description": "是否跳过已知误判消息",
+    "type": "bool",
+    "default": true,
+    "hint": "开启后，被标记为误判的消息（精确+归一化匹配）在检测前会被跳过，避免再次误判。误判记录在插件页「被警告消息备案」中通过撤回按钮产生。"
   }
 }

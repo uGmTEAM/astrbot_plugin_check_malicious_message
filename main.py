@@ -94,6 +94,8 @@ class CheckMaliciousMessagePlugin(Star):
         self._timeout_archive: list[dict] = []
         # 每日总结历史
         self._daily_summaries: list[dict] = []
+        # 误判撤回记录：被标记为误判的消息，检测前跳过以免再次误判
+        self._false_positives: list[dict] = []
         self._meta: dict = {
             "last_decrement": time.time(),
             "last_archive_check": 0.0,
@@ -176,6 +178,18 @@ class CheckMaliciousMessagePlugin(Star):
             ["POST"],
             "清理超时记录",
         )
+        self.context.register_web_api(
+            f"/{PLUGIN_NAME}/revoke",
+            self._api_revoke,
+            ["POST"],
+            "撤回误判警告（递减 count 并标记以免再次误判）",
+        )
+        self.context.register_web_api(
+            f"/{PLUGIN_NAME}/false_positives",
+            self._api_false_positives,
+            ["GET"],
+            "获取误判撤回记录列表",
+        )
         # ---- 云同步 API（供 LLM 自助调用）----
         self.context.register_web_api(
             f"/{PLUGIN_NAME}/cloud/status",
@@ -212,6 +226,12 @@ class CheckMaliciousMessagePlugin(Star):
             self._api_cloud_records,
             ["GET"],
             "查询云端记录列表",
+        )
+        self.context.register_web_api(
+            f"/{PLUGIN_NAME}/cloud/revoke_record",
+            self._api_cloud_revoke_record,
+            ["POST"],
+            "向云端发送误判撤回请求（需 bot_id 一致）",
         )
 
     # ------------------------------------------------------------------ 生命周期
@@ -332,6 +352,11 @@ class CheckMaliciousMessagePlugin(Star):
 
         # 追踪消息（用于刷屏检测和防误判上下文）
         self._track_message(platform_id, group_id, sender_id, message_str, now)
+
+        # ---- 误判撤回标记：跳过已知误判消息，避免再次误判 ----
+        if bool(cfg.get("enable_false_positive_skip", True)) and self._is_false_positive(message_str):
+            logger.info(f"[恶意消息检测] 命中误判撤回标记，跳过检测: sender={sender_id}")
+            return None
 
         # ---- 刷屏检测 ----
         if bool(cfg.get("enable_spam_detect", True)) and not is_private and group_id:
@@ -1298,6 +1323,7 @@ class CheckMaliciousMessagePlugin(Star):
     ) -> None:
         """备案：保存被警告的消息内容与上下文（仅保留最近 500 条）。"""
         entry = {
+            "log_id": uuid.uuid4().hex[:12],
             "time": now,
             "time_str": self._fmt_ts(now),
             "user_id": event.get_sender_id(),
@@ -1312,11 +1338,34 @@ class CheckMaliciousMessagePlugin(Star):
             "muted": muted,
             "mute_minutes": mute_minutes,
             "is_admin": is_admin,
+            "revoked": False,
         }
         self._logs.append(entry)
         # 仅保留最近 500 条，防止无限增长
         if len(self._logs) > 500:
             self._logs = self._logs[-500:]
+
+    @staticmethod
+    def _normalize_msg(text: str) -> str:
+        """归一化消息文本用于误判匹配（去空白、去标点、小写）。"""
+        return re.sub(r"[\s\W_]+", "", (text or "")).lower()
+
+    def _is_false_positive(self, message: str) -> bool:
+        """检查消息是否在误判撤回列表中（精确 + 归一化匹配）。"""
+        if not self._false_positives:
+            return False
+        norm = self._normalize_msg(message)
+        if not norm:
+            return False
+        for fp in self._false_positives:
+            fp_msg = fp.get("message", "")
+            if not fp_msg:
+                continue
+            if fp_msg == message:
+                return True
+            if self._normalize_msg(fp_msg) == norm:
+                return True
+        return False
 
     async def _decrement_loop(self):
         """按 last_decrement 时间戳计算下一次衰减时刻，确保重载后倒计时一致。
@@ -1485,7 +1534,14 @@ class CheckMaliciousMessagePlugin(Star):
                 self._special_records = data.get("special_records", []) or []
                 self._timeout_archive = data.get("timeout_archive", []) or []
                 self._daily_summaries = data.get("daily_summaries", []) or []
+                self._false_positives = data.get("false_positives", []) or []
                 self._meta = data.get("meta", {}) or {}
+                # 为旧日志条目补填 log_id（升级兼容）
+                for log_entry in self._logs:
+                    if not log_entry.get("log_id"):
+                        log_entry["log_id"] = uuid.uuid4().hex[:12]
+                    if "revoked" not in log_entry:
+                        log_entry["revoked"] = False
                 cloud = data.get("cloud", {}) or {}
                 # 合并到默认 cloud 字典（保证新增字段有默认值）
                 for k, v in cloud.items():
@@ -1503,6 +1559,7 @@ class CheckMaliciousMessagePlugin(Star):
             self._special_records = []
             self._timeout_archive = []
             self._daily_summaries = []
+            self._false_positives = []
             self._meta = {"last_decrement": time.time(), "last_archive_check": 0.0, "last_daily_summary": 0.0}
 
     def _save(self):
@@ -1513,6 +1570,7 @@ class CheckMaliciousMessagePlugin(Star):
                 "special_records": self._special_records,
                 "timeout_archive": self._timeout_archive,
                 "daily_summaries": self._daily_summaries,
+                "false_positives": self._false_positives,
                 "meta": self._meta,
                 "cloud": self._cloud,
             }
@@ -2086,6 +2144,38 @@ class CheckMaliciousMessagePlugin(Star):
         self._cloud_record_error(f"delete: {msg}")
         return {"ok": False, "error": msg, "deleted": 0}
 
+    async def _cloud_revoke_record(
+        self, key: str, log_id: str, message: str, reason: str
+    ) -> dict:
+        """向云端发送误判撤回请求。
+
+        服务端校验：bot_id 必须在该记录的 sources 中（即上传该警告的 bot 才能撤回）。
+        """
+        if not self._cloud_enabled():
+            return {"ok": False, "error": "云同步未启用"}
+        if not bool(self.config.get("enable_cloud_revoke", True)):
+            return {"ok": False, "error": "云端误判撤回子功能未开启"}
+        body = {
+            "bot_id": self._cloud_bot_id(),
+            "record_key": key,
+            "log_id": log_id,
+            "message": message,
+            "reason": reason,
+        }
+        try:
+            status, resp = await self._cloud_http_request(
+                "POST", "/api/revoke_record", body=body
+            )
+        except Exception as e:
+            self._cloud_record_error(f"revoke: {e}")
+            return {"ok": False, "error": str(e)}
+        if status == 200 and resp.get("ok"):
+            logger.info(f"[恶意消息检测] 云端误判撤回成功: key={key} log_id={log_id}")
+            return {"ok": True, "revoked": resp.get("revoked", False)}
+        msg = resp.get("error") or f"HTTP {status}"
+        self._cloud_record_error(f"revoke: {msg}")
+        return {"ok": False, "error": msg}
+
     # ------------------------------------------------------------------ 插件页 Web API
 
     async def _api_stats(self):
@@ -2196,6 +2286,116 @@ class CheckMaliciousMessagePlugin(Star):
         logger.info(f"[恶意消息检测] 已清理 {count} 条超时记录")
         return json_response({"ok": True, "cleared": count})
 
+    async def _api_revoke(self):
+        """撤回误判警告。
+
+        body: {"log_id": "...", "reason": "误判理由"}
+        - 根据 log_id 找到备案记录
+        - 将该用户 count -1（不低于 0），total 不变（保留审计）
+        - 标记日志为 revoked
+        - 将消息+理由加入误判列表，避免再次误判
+        - 如启用云同步误判撤回，向云端发送撤回请求（需 bot_id 一致）
+        """
+        body = {}
+        try:
+            body = await request.json(default={}) or {}
+        except Exception as e:
+            logger.warning(f"[恶意消息检测] revoke 读取请求体失败: {e}")
+            body = {}
+        if not isinstance(body, dict):
+            body = {}
+        log_id = str(body.get("log_id", "") or "")
+        reason = str(body.get("reason", "") or "").strip()
+        if not log_id:
+            return error_response("缺少 log_id", status_code=400)
+        if not reason:
+            return error_response("缺少误判理由", status_code=400)
+
+        # 查找日志条目
+        target_log = None
+        for log_entry in self._logs:
+            if log_entry.get("log_id") == log_id:
+                target_log = log_entry
+                break
+        if target_log is None:
+            return error_response("未找到该日志记录", status_code=404)
+        if target_log.get("revoked"):
+            return error_response("该警告已被撤回", status_code=409)
+
+        uid = str(target_log.get("user_id", ""))
+        pid = str(target_log.get("platform_id", ""))
+        message = str(target_log.get("message", ""))
+        old_count = 0
+        new_count = 0
+
+        # 递减该用户 count
+        if uid:
+            key = self._record_key(pid, uid)
+            rec = self._records.get(key)
+            if rec:
+                old_count = int(rec.get("count", 0) or 0)
+                new_count = max(0, old_count - 1)
+                rec["count"] = new_count
+                # 触发云同步推送（如启用）
+                self._cloud_schedule_push(key)
+
+        # 标记日志为已撤回
+        target_log["revoked"] = True
+        target_log["revoke_reason"] = reason
+        target_log["revoked_at"] = time.time()
+
+        # 加入误判列表（去重：同消息已存在则跳过）
+        if message and not self._is_false_positive(message):
+            self._false_positives.append({
+                "message": message,
+                "reason": reason,
+                "original_reason": target_log.get("reason", ""),
+                "user_id": uid,
+                "platform_id": pid,
+                "log_id": log_id,
+                "revoked_at": target_log["revoked_at"],
+            })
+            # 限制误判列表上限
+            if len(self._false_positives) > 2000:
+                self._false_positives = self._false_positives[-2000:]
+
+        self._save()
+        logger.info(
+            f"[恶意消息检测] 撤回误判警告 log_id={log_id} user={uid} "
+            f"count {old_count} -> {new_count}"
+        )
+
+        # 云端撤回（如启用）
+        cloud_revoked = False
+        cloud_error = ""
+        if (
+            self._cloud_enabled()
+            and bool(self.config.get("enable_cloud_revoke", True))
+            and uid
+        ):
+            key = self._record_key(pid, uid)
+            cloud_result = await self._cloud_revoke_record(key, log_id, message, reason)
+            cloud_revoked = bool(cloud_result.get("ok"))
+            cloud_error = cloud_result.get("error", "")
+
+        return json_response({
+            "ok": True,
+            "log_id": log_id,
+            "old_count": old_count,
+            "new_count": new_count,
+            "cloud_revoked": cloud_revoked,
+            "cloud_error": cloud_error,
+        })
+
+    async def _api_false_positives(self):
+        """返回误判撤回记录列表。"""
+        limit = request.query.get("limit", 500, type=int) or 500
+        items = list(reversed(self._false_positives))[:limit]
+        return json_response({
+            "total": len(self._false_positives),
+            "items": items,
+        })
+
     # ------------------------------------------------------------------ 云同步 API
 
     async def _api_cloud_status(self):
@@ -2212,6 +2412,7 @@ class CheckMaliciousMessagePlugin(Star):
                 "sync_mute": self._cloud_feature_enabled("enable_cloud_sync_mute", False),
                 "delete_record": self._cloud_feature_enabled("enable_cloud_delete_record", False),
                 "upload_special": self._cloud_feature_enabled("enable_cloud_upload_special", True),
+                "revoke": bool(cfg.get("enable_cloud_revoke", True)),
             },
             "stats": {
                 "sync_count": int(self._cloud.get("sync_count", 0)),
@@ -2345,6 +2546,30 @@ class CheckMaliciousMessagePlugin(Star):
         if status == 200:
             return json_response(resp)
         return json_response({"ok": False, "error": resp.get("error", f"HTTP {status}"), "items": []})
+
+    async def _api_cloud_revoke_record(self):
+        """向云端发送误判撤回请求（LLM 可调用）。
+
+        body: {"record_key": "...", "log_id": "...", "message": "...", "reason": "..."}
+        """
+        body = {}
+        try:
+            body = await request.json(default={}) or {}
+        except Exception as e:
+            logger.warning(f"[恶意消息检测] cloud_revoke 读取请求体失败: {e}")
+            body = {}
+        if not isinstance(body, dict):
+            body = {}
+        key = str(body.get("record_key", "") or "")
+        log_id = str(body.get("log_id", "") or "")
+        message = str(body.get("message", "") or "")
+        reason = str(body.get("reason", "") or "").strip()
+        if not key:
+            return error_response("缺少 record_key", status_code=400)
+        if not reason:
+            return error_response("缺少误判理由", status_code=400)
+        result = await self._cloud_revoke_record(key, log_id, message, reason)
+        return json_response(result)
 
     def _next_decay_seconds(self) -> int:
         last = float(self._meta.get("last_decrement", 0) or 0)
@@ -2501,6 +2726,7 @@ class CheckMaliciousMessagePlugin(Star):
             "sync_mute": self._cloud_feature_enabled("enable_cloud_sync_mute", False),
             "delete_record": self._cloud_feature_enabled("enable_cloud_delete_record", False),
             "upload_special": self._cloud_feature_enabled("enable_cloud_upload_special", True),
+            "revoke": bool(self.config.get("enable_cloud_revoke", True)),
         }
         lines = [
             f"云同步状态：",
@@ -2512,6 +2738,7 @@ class CheckMaliciousMessagePlugin(Star):
             f"    同步禁言状态：{'✅' if feat['sync_mute'] else '❌'}（⚠️ 有误禁言风险）",
             f"    删除云端记录：{'✅' if feat['delete_record'] else '❌'}（需 admin_token）",
             f"    上传特殊记录：{'✅' if feat['upload_special'] else '❌'}",
+            f"    误判撤回：{'✅' if feat['revoke'] else '❌'}（需 bot_id 一致）",
             f"  统计：",
             f"    累计同步 {self._cloud.get('sync_count', 0)} 次，推送 {self._cloud.get('push_count', 0)} 次，拉取 {self._cloud.get('pull_count', 0)} 次",
             f"    累计错误 {self._cloud.get('error_count', 0)} 次",
