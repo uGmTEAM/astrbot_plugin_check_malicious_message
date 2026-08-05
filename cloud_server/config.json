@@ -1,0 +1,15 @@
+{
+  "_comment": "恶意消息检测插件 - 云同步服务端配置文件",
+  "host": "0.0.0.0",
+  "port": 8765,
+  "data_dir": "data",
+  "log_dir": "logs",
+  "client_token": "CHANGE_ME_TO_A_LONG_RANDOM_STRING",
+  "admin_token": "CHANGE_ME_TO_A_DIFFERENT_LONG_RANDOM_STRING",
+  "max_record_size": 100000,
+  "max_special_records": 10000,
+  "max_audit_log_entries": 5000,
+  "request_timeout_seconds": 30,
+  "enable_request_logging": true,
+  "cors_origins": ["*"]
+}
