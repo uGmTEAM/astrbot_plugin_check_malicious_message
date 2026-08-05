@@ -31,7 +31,7 @@ from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
-__VERSION__ = "1.2.0"
+__VERSION__ = "1.3.0"
 CONFIG_PATH_DEFAULT = "config.json"
 RECORDS_FILE = "records.json"
 SPECIAL_FILE = "special_records.json"
@@ -551,10 +551,12 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/api/health":
                 return self._handle_health()
             if path == "/api/auth_check":
-                # 供前端校验 token 是否有效
-                if not self._check_admin_token():
-                    return self._send_error_json(HTTPStatus.UNAUTHORIZED, "invalid admin token")
-                return self._send_json(HTTPStatus.OK, {"ok": True, "role": "admin"})
+                # 供前端校验 token 是否有效，自动识别类型
+                if self._check_admin_token():
+                    return self._send_json(HTTPStatus.OK, {"ok": True, "token_type": "admin"})
+                if self._check_client_token():
+                    return self._send_json(HTTPStatus.OK, {"ok": True, "token_type": "client"})
+                return self._send_error_json(HTTPStatus.UNAUTHORIZED, "invalid token")
             if path == "/api/stats":
                 if not self._check_any_token():
                     log_request("GET", path, 401, self.client_address[0])
@@ -852,19 +854,25 @@ class Handler(BaseHTTPRequestHandler):
         })
 
     def _handle_auth(self):
-        """Web 管理器登录：校验 admin_token。"""
+        """Web 管理器登录：接受 admin_token 或 client_token，自动识别类型。"""
         body, err = self._read_body()
         if err:
             return self._send_error_json(HTTPStatus.BAD_REQUEST, f"invalid body: {err}")
         token = str(body.get("token", "") or "")
         if not token:
             return self._send_error_json(HTTPStatus.BAD_REQUEST, "missing token")
-        if token == CONFIG.get("admin_token"):
-            log_request("POST", "/api/auth", 200, self.client_address[0], "login_ok")
-            audit_log("login", "web", {"client": self.client_address[0]})
-            return self._send_json(HTTPStatus.OK, {"ok": True, "role": "admin"})
+        admin_tok = CONFIG.get("admin_token")
+        client_tok = CONFIG.get("client_token")
+        if token == admin_tok:
+            log_request("POST", "/api/auth", 200, self.client_address[0], "login_admin")
+            audit_log("login", "web_admin", {"client": self.client_address[0]})
+            return self._send_json(HTTPStatus.OK, {"ok": True, "token_type": "admin"})
+        if token == client_tok:
+            log_request("POST", "/api/auth", 200, self.client_address[0], "login_client")
+            audit_log("login", "web_client", {"client": self.client_address[0]})
+            return self._send_json(HTTPStatus.OK, {"ok": True, "token_type": "client"})
         log_request("POST", "/api/auth", 401, self.client_address[0], "login_fail")
-        return self._send_error_json(HTTPStatus.UNAUTHORIZED, "invalid admin token")
+        return self._send_error_json(HTTPStatus.UNAUTHORIZED, "invalid token")
 
     def _handle_revoke_record(self):
         """误判撤回：校验 bot_id 在记录 sources 中，递减 count。
