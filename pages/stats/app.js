@@ -145,7 +145,7 @@ async function loadStats() {
         return `<tr>
           <td>${i + 1}</td>
           <td>
-            <div class="user">${escapeHtml(r.sender_name || r.user_id || "未知")}</div>
+            <div class="user clickable" data-user-id="${escapeHtml(r.user_id || "")}" data-platform-id="${escapeHtml(r.platform_id || "")}" title="点击查看该用户的警告详情">${escapeHtml(r.sender_name || r.user_id || "未知")}</div>
             <div class="uid">UID: ${escapeHtml(r.user_id || "-")}</div>
           </td>
           <td>${escapeHtml(r.platform || "-")}</td>
@@ -163,6 +163,12 @@ async function loadStats() {
 
     tbody.querySelectorAll('button[data-action="reset"]').forEach((btn) => {
       btn.addEventListener("click", () => resetUser(btn.dataset.key, btn.dataset.uid, btn));
+    });
+    // 绑定用户名点击 → 打开警告详情弹窗
+    tbody.querySelectorAll(".user.clickable").forEach((el) => {
+      el.addEventListener("click", () => {
+        openUserLogs(el.dataset.userId, el.dataset.platformId, el.textContent);
+      });
     });
   } catch (e) {
     if (activeTab === "stats") {
@@ -210,7 +216,7 @@ async function loadLogs() {
           <td>${i + 1}</td>
           <td>${escapeHtml(r.time_str || "-")}${revokedTag}</td>
           <td>
-            <div class="user">${escapeHtml(r.sender_name || r.user_id || "未知")}${adminTag}</div>
+            <div class="user clickable" data-user-id="${escapeHtml(r.user_id || "")}" data-platform-id="${escapeHtml(r.platform_id || "")}" title="点击查看该用户的全部警告">${escapeHtml(r.sender_name || r.user_id || "未知")}${adminTag}</div>
             <div class="uid">UID: ${escapeHtml(r.user_id || "-")}</div>
           </td>
           <td>${scope}</td>
@@ -225,6 +231,12 @@ async function loadLogs() {
 
     logTbody.querySelectorAll('button[data-action="revoke"]').forEach((btn) => {
       btn.addEventListener("click", () => revokeWarning(btn.dataset.logId, btn));
+    });
+    // 绑定用户名点击 → 打开警告详情弹窗
+    logTbody.querySelectorAll(".user.clickable").forEach((el) => {
+      el.addEventListener("click", () => {
+        openUserLogs(el.dataset.userId, el.dataset.platformId, el.textContent);
+      });
     });
   } catch (e) {
     if (activeTab === "logs") {
@@ -394,6 +406,78 @@ async function resetUser(key, uid, btn) {
   } finally {
     btn.disabled = false;
   }
+}
+
+// ---------------------------------------------------------------------------
+// 用户警告详情弹窗（点击用户名查看其所有警告记录）
+// ---------------------------------------------------------------------------
+
+const userLogsModal = document.getElementById("userLogsModal");
+const userLogsTitle = document.getElementById("userLogsTitle");
+const userLogsBody = document.getElementById("userLogsBody");
+const userLogsClose = document.getElementById("userLogsClose");
+
+function closeUserLogs() {
+  if (userLogsModal) userLogsModal.classList.remove("show");
+}
+
+async function openUserLogs(uid, pid, userName) {
+  if (!uid) {
+    toast("该记录缺少 user_id，无法查看详情", "error");
+    return;
+  }
+  if (userLogsTitle) userLogsTitle.textContent = `用户 "${userName || uid}" 的警告详情`;
+  if (userLogsBody) userLogsBody.innerHTML = "<p class='hint'>加载中…</p>";
+  if (userLogsModal) userLogsModal.classList.add("show");
+  try {
+    const params = { user_id: uid, limit: 500 };
+    if (pid) params.platform_id = pid;
+    const res = await bridge.apiGet("logs", params);
+    const data = res && res.data !== undefined ? res.data : res;
+    const items = (data && data.items) || [];
+    if (!items.length) {
+      userLogsBody.innerHTML = "<p class='empty'>该用户暂无警告记录。</p>";
+      return;
+    }
+    userLogsBody.innerHTML = `
+      <div class="user-logs-summary">共 <b>${items.length}</b> 条警告记录</div>
+      <div class="user-logs-list">
+        ${items.map((l) => {
+          const scope = l.is_private
+            ? `${escapeHtml(l.platform || "-")} · 私聊`
+            : `${escapeHtml(l.platform || "-")} · 群 ${escapeHtml(l.group_id || "-")}`;
+          const mutedTag = l.muted
+            ? `<span class="badge muted">禁言 ${escapeHtml(l.mute_minutes || 0)}分</span>`
+            : "";
+          const revokedTag = l.revoked
+            ? ` <span class="badge revoked">已撤回</span>`
+            : "";
+          return `<div class="log-entry${l.revoked ? " revoked-entry" : ""}">
+            <div class="log-time">${escapeHtml(l.time_str || "-")}${revokedTag}${mutedTag}</div>
+            <div class="log-message"><strong>消息:</strong> ${escapeHtml(l.message || "-")}</div>
+            <div class="log-reason"><strong>原因:</strong> ${escapeHtml(l.reason || "无")}</div>
+            <div class="log-meta">x=${l.count || 0} · ${scope}</div>
+          </div>`;
+        }).join("")}
+      </div>
+    `;
+  } catch (e) {
+    userLogsBody.innerHTML = `<p class="err">加载失败: ${escapeHtml(e && e.message ? e.message : e)}</p>`;
+  }
+}
+
+if (userLogsClose) {
+  userLogsClose.addEventListener("click", closeUserLogs);
+}
+if (userLogsModal) {
+  userLogsModal.addEventListener("click", (e) => {
+    if (e.target === userLogsModal) closeUserLogs();
+  });
+  document.addEventListener("keydown", (e) => {
+    if (e.key === "Escape" && userLogsModal.classList.contains("show")) {
+      closeUserLogs();
+    }
+  });
 }
 
 // ---------------------------------------------------------------------------
