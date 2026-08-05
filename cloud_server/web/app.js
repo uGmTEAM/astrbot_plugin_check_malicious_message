@@ -140,13 +140,20 @@
         el.style.display = "";
       }
     });
-    // client 模式：隐藏审计/请求日志标签页（仅 admin 可用）
+    // client 模式：隐藏去重按钮（仅 admin 可用）
+    const dedupBtns = document.querySelectorAll("[data-action='dedup']");
+    dedupBtns.forEach((el) => {
+      el.style.display = isClient() ? "none" : "";
+    });
+    // client 模式：隐藏审计/请求日志/黑名单标签页（仅 admin 可用）
     const auditTab = document.querySelector('.tab[data-tab="audit"]');
     const requestsTab = document.querySelector('.tab[data-tab="requests"]');
+    const blacklistTab = document.querySelector('.tab[data-tab="blacklist"]');
     if (auditTab) auditTab.style.display = isClient() ? "none" : "";
     if (requestsTab) requestsTab.style.display = isClient() ? "none" : "";
+    if (blacklistTab) blacklistTab.style.display = isClient() ? "none" : "";
     // 如果当前 tab 是受限的，切回 overview
-    if (isClient() && (activeTab === "audit" || activeTab === "requests")) {
+    if (isClient() && (activeTab === "audit" || activeTab === "requests" || activeTab === "blacklist")) {
       switchTab("overview");
     }
   }
@@ -232,6 +239,7 @@
     else if (tab === "special") await loadSpecial();
     else if (tab === "audit") await loadAudit();
     else if (tab === "requests") await loadRequests();
+    else if (tab === "blacklist") await loadBlacklist();
   }
 
   function loadAll() {
@@ -407,6 +415,44 @@
     });
   }
 
+  // ---- 去重按钮 ----
+  async function handleDedup(type) {
+    if (!isAdmin()) {
+      toast("客户端模式无此权限", "error");
+      return;
+    }
+    const typeLabel = type === "records" ? "警告记录" : type === "special" ? "特殊记录" : "全部";
+    if (!(await asyncConfirm(`确认对${typeLabel}执行去重？\n记录：清理 count=0、未禁言、超过30天的僵尸记录\n特殊：按指纹去重，保留首次出现`))) return;
+    try {
+      toast("去重中…", "info");
+      const data = await apiPost("/api/dedup", { type });
+      if (data.ok) {
+        const r = data.records || {};
+        const s = data.special || {};
+        const parts = [];
+        if (r.removed !== undefined) parts.push(`记录清理 ${r.removed} 条`);
+        if (s.removed !== undefined) parts.push(`特殊去重 ${s.removed} 条`);
+        toast(`去重完成：${parts.join("，") || "无变化"}`, "ok");
+        await loadRecords();
+        await loadSpecial();
+        await loadOverview();
+      } else {
+        toast("去重失败: " + (data.error || "未知错误"), "error");
+      }
+    } catch (e) {
+      toast("去重失败: " + e.message, "error");
+    }
+  }
+
+  const dedupRecordsBtn = document.getElementById("dedupRecordsBtn");
+  if (dedupRecordsBtn) {
+    dedupRecordsBtn.addEventListener("click", () => handleDedup("records"));
+  }
+  const dedupSpecialBtn = document.getElementById("dedupSpecialBtn");
+  if (dedupSpecialBtn) {
+    dedupSpecialBtn.addEventListener("click", () => handleDedup("special"));
+  }
+
   async function deleteRecord(key) {
     if (!isAdmin()) {
       toast("客户端模式无此权限", "error");
@@ -516,6 +562,78 @@
     } catch (e) {
       toast("加载请求日志失败: " + e.message, "error");
     }
+  }
+
+  // ---- IP 黑名单管理 ----
+  const blacklistInput = document.getElementById("blacklistInput");
+  const blacklistAddBtn = document.getElementById("blacklistAddBtn");
+
+  async function loadBlacklist() {
+    const tbody = document.getElementById("blacklistTbody");
+    const empty = document.getElementById("blacklistEmpty");
+    try {
+      const data = await apiGet("/api/blacklist");
+      const items = data.items || [];
+      if (!items.length) {
+        tbody.innerHTML = "";
+        empty.hidden = false;
+        return;
+      }
+      empty.hidden = true;
+      tbody.innerHTML = items.map((ip) => `
+        <tr>
+          <td><code>${escapeHtml(ip)}</code></td>
+          <td><button class="btn small danger" data-remove-ip="${escapeHtml(ip)}">移除</button></td>
+        </tr>
+      `).join("");
+      // 绑定移除按钮
+      tbody.querySelectorAll("[data-remove-ip]").forEach((btn) => {
+        btn.addEventListener("click", async () => {
+          const ip = btn.dataset.removeIp;
+          if (!(await asyncConfirm(`确认从黑名单移除 ${ip}？`))) return;
+          try {
+            const res = await apiPost("/api/blacklist/remove", { ip });
+            if (res.ok) {
+              toast(`已移除 ${ip}`, "ok");
+              await loadBlacklist();
+            } else {
+              toast("移除失败", "error");
+            }
+          } catch (e) {
+            toast("移除失败: " + e.message, "error");
+          }
+        });
+      });
+    } catch (e) {
+      toast("加载黑名单失败: " + e.message, "error");
+    }
+  }
+
+  if (blacklistAddBtn) {
+    blacklistAddBtn.addEventListener("click", async () => {
+      const ip = (blacklistInput.value || "").trim();
+      if (!ip) {
+        toast("请输入 IP 或前缀", "error");
+        return;
+      }
+      try {
+        const res = await apiPost("/api/blacklist/add", { ip });
+        if (res.ok) {
+          toast(`已拉黑 ${ip}`, "ok");
+          blacklistInput.value = "";
+          await loadBlacklist();
+        } else {
+          toast("拉黑失败", "error");
+        }
+      } catch (e) {
+        toast("拉黑失败: " + e.message, "error");
+      }
+    });
+  }
+  if (blacklistInput) {
+    blacklistInput.addEventListener("keydown", (e) => {
+      if (e.key === "Enter") blacklistAddBtn?.click();
+    });
   }
 
   // ---- 启动 ----

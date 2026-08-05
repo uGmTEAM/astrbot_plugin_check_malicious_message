@@ -11,11 +11,10 @@
     <div id="loginPage" class="login-page">
       <div class="login-card">
         <h1>☁️ 云同步管理器</h1>
-        <p class="sub">请输入 token 登录（支持 admin_token 或 client_token）</p>
-        <input id="tokenInput" type="password" placeholder="admin_token / client_token" />
+        <p class="sub">请输入 token 登录</p>
+        <input id="tokenInput" type="password" placeholder="请输入 token" />
         <button id="loginBtn" class="btn">登录</button>
         <p id="loginError" class="err" hidden></p>
-        <p class="login-hint">admin_token：完整管理权限<br>client_token：只读权限（查看数据、刷新）</p>
       </div>
     </div>
 
@@ -35,7 +34,7 @@
 
       <!-- client 模式提示 -->
       <div id="clientNotice" class="client-notice" hidden>
-        🔒 当前为客户端模式，仅可查看数据。如需删除记录或查看日志，请使用 admin_token 登录。
+        🔒 当前为只读模式，仅可查看数据。
       </div>
 
       <nav class="tabs">
@@ -44,6 +43,7 @@
         <button class="tab" data-tab="special">🔴 特殊记录</button>
         <button class="tab" data-tab="audit">📝 审计日志</button>
         <button class="tab" data-tab="requests">🌐 请求日志</button>
+        <button class="tab" data-tab="blacklist" data-admin-only>🚫 IP 黑名单</button>
       </nav>
 
       <!-- 概览 -->
@@ -55,6 +55,7 @@
       <section id="pane-records" class="pane" hidden>
         <div class="toolbar">
           <input id="recordSearch" type="text" placeholder="搜索 UID / 用户名 / 平台…" class="search" />
+          <button id="dedupRecordsBtn" class="btn small" data-action="dedup" style="display:none">🧹 去重</button>
           <button id="deleteSelectedBtn" class="btn small danger" disabled>删除选中</button>
         </div>
         <div class="table-wrap">
@@ -81,6 +82,10 @@
 
       <!-- 特殊记录 -->
       <section id="pane-special" class="pane" hidden>
+        <div class="toolbar">
+          <span class="hint">按指纹去重（保留首次出现，移除重复项）</span>
+          <button id="dedupSpecialBtn" class="btn small" data-action="dedup" style="display:none">🧹 去重特殊记录</button>
+        </div>
         <div class="table-wrap">
           <table id="specialTable">
             <thead>
@@ -142,6 +147,27 @@
           </table>
         </div>
         <p class="empty" id="requestEmpty" hidden>暂无请求日志。</p>
+      </section>
+
+      <!-- IP 黑名单 -->
+      <section id="pane-blacklist" class="pane" hidden>
+        <div class="toolbar">
+          <input id="blacklistInput" type="text" placeholder="输入 IP 或前缀（如 192.168.1. 或 10.0.0.1）" class="search" />
+          <button id="blacklistAddBtn" class="btn small danger">🚫 拉黑</button>
+        </div>
+        <p class="hint">支持精确匹配（10.0.0.1）和前缀匹配（192.168.1. 将拉黑该网段所有IP）。被拉黑的IP访问WebUI或API将返回拦截文本。</p>
+        <div class="table-wrap">
+          <table id="blacklistTable">
+            <thead>
+              <tr>
+                <th>IP / 前缀</th>
+                <th>操作</th>
+              </tr>
+            </thead>
+            <tbody id="blacklistTbody"></tbody>
+          </table>
+        </div>
+        <p class="empty" id="blacklistEmpty" hidden>暂无拉黑的 IP。</p>
       </section>
     </div>
 
