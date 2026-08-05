@@ -119,6 +119,7 @@ class CheckMaliciousMessagePlugin(Star):
         self._cloud: dict = {
             "bot_id": "",
             "last_sync_ts": 0.0,        # 上次成功同步的时间戳
+            "last_attempt_ts": 0.0,      # 上次尝试同步的时间戳（用于倒计时和循环触发）
             "last_pull_ts": 0.0,        # 上次拉取基准（since 参数）
             "last_push_ts": 0.0,        # 上次推送时间戳
             "last_error": "",
@@ -2072,14 +2073,14 @@ class CheckMaliciousMessagePlugin(Star):
         if self._cloud_syncing:
             return {"ok": False, "error": "同步进行中，跳过本次"}
         self._cloud_syncing = True
-        # 在开始同步前更新 last_sync_ts，确保即使同步失败也能正确显示下次倒计时
-        # 仅当 last_sync_ts 为 0（首次同步）或已超过间隔时才更新
+        # 在开始同步前更新 last_attempt_ts，确保即使同步失败也能正确显示下次倒计时
+        # 仅当 last_attempt_ts 为 0（首次同步）或已超过间隔时才更新
         now = time.time()
-        last = float(self._cloud.get("last_sync_ts", 0) or 0)
+        last_attempt = float(self._cloud.get("last_attempt_ts", 0) or 0)
         interval = int(self.config.get("cloud_sync_interval", CLOUD_DEFAULT_INTERVAL) or CLOUD_DEFAULT_INTERVAL)
         interval = max(30, interval)
-        if last <= 0 or now - last >= interval:
-            self._cloud["last_sync_ts"] = now
+        if last_attempt <= 0 or now - last_attempt >= interval:
+            self._cloud["last_attempt_ts"] = now
         try:
             # 1. 拉取（拉取本身不需要子开关，是否合并由 _cloud_apply_remote_records 控制）
             pull_result = await self._cloud_pull()
@@ -2119,7 +2120,7 @@ class CheckMaliciousMessagePlugin(Star):
         except Exception as e:
             self._cloud_record_error(f"full_sync: {e}")
             logger.warning(f"[恶意消息检测] 云同步异常: {e}")
-            # 同步失败也持久化 last_sync_ts，避免重载后回到 0 导致倒计时卡死
+            # 同步失败也持久化 last_attempt_ts 和错误信息，避免重载后倒计时卡死
             self._save()
             return {"ok": False, "error": str(e)}
         finally:
@@ -2134,7 +2135,7 @@ class CheckMaliciousMessagePlugin(Star):
                 if self._cloud_enabled():
                     interval = int(self.config.get("cloud_sync_interval", CLOUD_DEFAULT_INTERVAL) or CLOUD_DEFAULT_INTERVAL)
                     interval = max(30, interval)
-                    last = float(self._cloud.get("last_sync_ts", 0) or 0)
+                    last = float(self._cloud.get("last_attempt_ts", 0) or 0)
                     if time.time() - last >= interval:
                         await self._cloud_full_sync()
                 # 短睡眠以便及时响应取消
@@ -2452,6 +2453,8 @@ class CheckMaliciousMessagePlugin(Star):
             "timing": {
                 "last_sync_ts": float(self._cloud.get("last_sync_ts", 0) or 0),
                 "last_sync_str": self._fmt_ts(float(self._cloud.get("last_sync_ts", 0) or 0)),
+                "last_attempt_ts": float(self._cloud.get("last_attempt_ts", 0) or 0),
+                "last_attempt_str": self._fmt_ts(float(self._cloud.get("last_attempt_ts", 0) or 0)),
                 "last_pull_ts": float(self._cloud.get("last_pull_ts", 0) or 0),
                 "last_pull_str": self._fmt_ts(float(self._cloud.get("last_pull_ts", 0) or 0)),
                 "last_push_ts": float(self._cloud.get("last_push_ts", 0) or 0),
@@ -2483,7 +2486,7 @@ class CheckMaliciousMessagePlugin(Star):
             interval = max(30, interval)
         except (TypeError, ValueError):
             interval = CLOUD_DEFAULT_INTERVAL
-        last = float(self._cloud.get("last_sync_ts", 0) or 0)
+        last = float(self._cloud.get("last_attempt_ts", 0) or 0)
         if last <= 0:
             return 0
         elapsed = time.time() - last
@@ -2770,10 +2773,11 @@ class CheckMaliciousMessagePlugin(Star):
             f"  统计：",
             f"    累计同步 {self._cloud.get('sync_count', 0)} 次，推送 {self._cloud.get('push_count', 0)} 次，拉取 {self._cloud.get('pull_count', 0)} 次",
             f"    累计错误 {self._cloud.get('error_count', 0)} 次",
-            f"    上次同步：{self._fmt_ts(float(self._cloud.get('last_sync_ts', 0) or 0))}",
+            f"    上次成功同步：{self._fmt_ts(float(self._cloud.get('last_sync_ts', 0) or 0))}",
+            f"    上次尝试同步：{self._fmt_ts(float(self._cloud.get('last_attempt_ts', 0) or 0))}",
             f"    上次上传：{self._cloud.get('last_uploaded_records', 0)} 条",
             f"    上次拉取：记录 {self._cloud.get('last_pulled_records', 0)} 条，特殊 {self._cloud.get('last_pulled_special', 0)} 条",
-            f"    距下次同步：{self._cloud_next_sync_seconds(self.config) // 60} 分钟",
+            f"    距下次同步：{self._cloud_next_sync_seconds(self.config)} 秒",
             f"    待推送：{len(self._cloud_pending_push)} 条记录，{self._cloud_pending_special} 条特殊记录",
         ]
         err = self._cloud.get("last_error", "")
