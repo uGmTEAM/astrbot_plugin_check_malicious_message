@@ -1,5 +1,59 @@
 # 更新日志
 
+## v1.3.1 — 2026-08-05
+
+### 新增功能
+
+- **🔄 手动去重功能**：支持手动清理本地和云端的冗余记录。
+  - **普通记录去重**：清理 `count=0`、未禁言、`last_warned` 超过 30 天的僵尸记录；
+  - **特殊记录去重**：按指纹（`cloud_bot_id + user_id + platform_id + time + message`）去重，**仅去重不删除非重复记录**；
+  - **服务端**（`cloud_server/server.py`）：
+    - `POST /api/dedup` 端点（admin_token 鉴权），支持 `type=records`、`type=special`、或空=全部；
+    - 新增 `_special_fingerprint()` 函数生成指纹；
+  - **客户端**（`main.py`）：
+    - 新增 `_do_cloud_dedup()` 方法（本地清理 + 云端调用）；
+    - 注册 Web API `/cloud/dedup`；
+    - 新增管理员指令 `云去重`（支持 `云去重`、`云去重 records`、`云去重 special`）；
+  - **WebUI**：
+    - 管理器前端增加「🧹 去重」按钮（记录页和特殊记录页）；
+    - 插件页云同步标签页增加「🧹 去重」按钮。
+
+- **🌐 上传数据自动查重**：多次上传相同数据时自动去重，以服务端为准。
+  - 服务端 `_handle_upload_record` 以 `(key, last_warned)` 为键去重；
+  - 服务端 `_handle_upload_special` 使用 `_special_fingerprint` 指纹去重；
+  - 客户端显示服务端返回的 `skipped` 数量。
+
+- **🚫 IP 黑名单功能**：管理员可通过 WebUI 或 AstrBot 插件指令拉黑 IP，被拉黑的 IP 访问 WebUI 或发送 API 请求时返回特定文本。
+  - **服务端**：
+    - 新增 `BLACKLIST` 全局变量（支持精确匹配和前缀匹配，如 `192.168.1.` 拉黑整个网段）；
+    - `_check_blacklist()` 方法在 `do_GET` 和 `do_POST` 入口调用；
+    - 新增管理 API：`GET /api/blacklist`、`POST /api/blacklist/add`、`POST /api/blacklist/remove`（均需 admin_token）；
+    - 健康检查端点 `/api/health` 不拉黑，避免影响负载均衡；
+    - 被拉黑的 IP 收到 HTTP 403 及文本「你的IP已被拉黑，无法访问此服务。」；
+  - **客户端**（`main.py`）：
+    - 新增 Web API：`/cloud/blacklist`（GET）、`/cloud/blacklist_add`（POST）、`/cloud/blacklist_remove`（POST）；
+    - 新增管理员指令 `云黑名单`：`云黑名单 list` 查看列表、`云黑名单 add <ip>` 添加、`云黑名单 rm <ip>` 移除；
+  - **WebUI**：
+    - 新增「🚫 IP 黑名单」标签页（仅 admin 可见）；
+    - 支持添加 IP/前缀、查看列表、移除 IP。
+
+- **🔒 登录界面简化**：
+  - 登录页仅显示「请输入 token 登录」，不再告知双 token 类型；
+  - `client_token` 登录后隐藏所有提及 `admin_token` 的提示；
+  - client 模式提示简化为「🔒 当前为只读模式，仅可查看数据。」。
+
+### 修复
+
+- **云同步卡死问题**：修复同步运行一段时间后「距下次同步」卡死在"即将"且自动同步不再触发的问题。
+  - 根因：`last_attempt_ts` 仅在同步循环内部更新，手动同步 API `_api_cloud_sync` 未更新该时间戳，导致手动同步后倒计时仍显示旧时间戳；
+  - 修复：
+    - 将 `last_attempt_ts` 更新逻辑从同步循环移入 `_cloud_full_sync` 方法开头，**所有调用路径**（循环触发、手动API、定时同步）都会统一更新时间戳；
+    - 同步循环增加防抖：当 `_cloud_full_sync` 因 `_cloud_syncing` 被跳过时，等待 10 秒后重试，避免 tight loop。
+
+### 服务端版本同步
+
+- 服务端 `__VERSION__` 更新至 `1.3.1`。
+
 ## v1.3.0 — 2026-08-05
 
 ### 新增功能

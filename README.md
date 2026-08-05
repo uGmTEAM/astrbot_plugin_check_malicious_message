@@ -17,6 +17,7 @@
 - **☁️ 多 bot 云同步**：自建云服务端后，多个 bot 可共享警告记录、禁言状态与特殊记录；
 - **↩️ 误判撤回**：被警告消息备案页可一键撤回误判警告，自动递减 count 并标记消息以免再次误判，同时向云端发送撤回请求（需 bot_id 一致）；
 - **🖥️ 云端可视化管理器**：浏览器访问服务端地址即可进入管理后台，查看记录、特殊记录、审计日志、请求日志；
+- **🚫 IP 黑名单**：管理员可通过 WebUI 或 AstrBot 指令拉黑 IP，被拉黑 IP 无法访问服务端；
 - 通过 **插件页面**实时展示每个人的 x 次数。
 
 ## 功能特性
@@ -355,6 +356,10 @@ LLM 可通过以下 Web API 自助调用云同步功能（AstrBot 自动转发�
 | POST | `cloud/delete_record` | Dashboard | 删除云端记录（body: `{"keys": [...]}`，需 admin_token + 子开关） |
 | POST | `cloud/revoke_record` | Dashboard | 向云端发送误判撤回请求（body: `{"record_key","log_id","message","reason"}`，需 bot_id 一致） |
 | GET | `cloud/records` | Dashboard | 查询云端记录列表 |
+| POST | `cloud/dedup` | Dashboard | 手动去重（body: `{"type": "records"|"special"|""}`，需 admin_token） |
+| GET | `cloud/blacklist` | Dashboard | 获取云端 IP 黑名单列表（需 admin_token） |
+| POST | `cloud/blacklist_add` | Dashboard | 添加 IP 到云端黑名单（body: `{"ip": "..."}`，需 admin_token） |
+| POST | `cloud/blacklist_remove` | Dashboard | 从云端黑名单移除 IP（body: `{"ip": "..."}`，需 admin_token） |
 | POST | `revoke` | Dashboard | 本地撤回误判警告（body: `{"log_id","reason"}`，递减 count 并标记以免再次误判） |
 | GET | `false_positives` | Dashboard | 查询误判撤回记录列表 |
 
@@ -364,12 +369,13 @@ LLM 可通过以下 Web API 自助调用云同步功能（AstrBot 自动转发�
 
 浏览器访问服务端地址（如 `http://your-server:8765/`）即可进入管理后台：
 
-1. **无 Token 自动进入登录页**，输入 `admin_token` 登录；
+1. **输入 Token 登录**，系统自动识别 Token 类型（管理员/客户端）；
 2. **📊 概览**：记录总数、特殊记录数、禁言中用户、高风险用户、贡献 Bot 列表、运行时长；
 3. **📋 警告记录**：搜索（UID/用户名/平台）、批量删除（复选框）、单条删除；
 4. **🔴 特殊记录**：按人分类查看政治敏感/违法内容；
 5. **📝 审计日志**：查看最近 500 条审计记录（撤回/删除/登录/上传/同步等操作）；
-6. **🌐 请求日志**：查看最近 500 条 HTTP 请求记录（方法/路径/状态/客户端）。
+6. **🌐 请求日志**：查看最近 500 条 HTTP 请求记录（方法/路径/状态/客户端）；
+7. **🚫 IP 黑名单**（仅管理员）：添加/移除 IP 黑名单，被拉黑 IP 无法访问服务。
 
 管理器前端文件位于 `cloud_server/web/`（`index.html` / `app.js` / `style.css`），由服务端自动提供，无需额外配置。
 
@@ -394,6 +400,8 @@ LLM 可通过以下 Web API 自助调用云同步功能（AstrBot 自动转发�
 | `/malicious_wl_list` | `恶意白名单列表` | 查看当前群白名单 |
 | `/malicious_cloud_status` | `云状态` | 查看云同步状态（子功能开关、统计、上次同步时间等） |
 | `/malicious_cloud_sync` | `云同步` | 手动触发一次云同步（拉取+推送） |
+| `/malicious_cloud_dedup` | `云去重` | 手动去重：清理本地僵尸记录 + 云端去重（支持 records/special 参数） |
+| `/malicious_cloud_blacklist` | `云黑名单` | 管理云端 IP 黑名单（list 查看 / add <ip> 添加 / rm <ip> 移除） |
 
 群白名单指令会通过 `save_config_async` 直接写回插件配置文件，WebUI 配置页与运行时保持一致。
 

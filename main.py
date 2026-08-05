@@ -240,6 +240,24 @@ class CheckMaliciousMessagePlugin(Star):
             ["POST"],
             "手动去重：清理僵尸记录 + 特殊记录指纹去重（需 admin_token）",
         )
+        self.context.register_web_api(
+            f"/{PLUGIN_NAME}/cloud/blacklist",
+            self._api_cloud_blacklist,
+            ["GET"],
+            "获取云端 IP 黑名单列表（需 admin_token）",
+        )
+        self.context.register_web_api(
+            f"/{PLUGIN_NAME}/cloud/blacklist_add",
+            self._api_cloud_blacklist_add,
+            ["POST"],
+            "添加 IP 到云端黑名单（需 admin_token）",
+        )
+        self.context.register_web_api(
+            f"/{PLUGIN_NAME}/cloud/blacklist_remove",
+            self._api_cloud_blacklist_remove,
+            ["POST"],
+            "从云端黑名单移除 IP（需 admin_token）",
+        )
 
     # ------------------------------------------------------------------ 生命周期
 
@@ -2709,6 +2727,102 @@ class CheckMaliciousMessagePlugin(Star):
         self._cloud_record_error(f"dedup: {msg}")
         return {"ok": False, "error": msg}
 
+    # ------------------------------------------------------------------ 云黑名单
+
+    async def _api_cloud_blacklist(self):
+        """获取云端 IP 黑名单列表。"""
+        result = await self._cloud_blacklist_list()
+        return json_response(result)
+
+    async def _api_cloud_blacklist_add(self):
+        """添加 IP 到云端黑名单。body: {"ip": "192.168.1."}"""
+        body = {}
+        try:
+            body = await request.json(default={}) or {}
+        except Exception:
+            body = {}
+        if not isinstance(body, dict):
+            body = {}
+        ip = str(body.get("ip", "") or "").strip()
+        if not ip:
+            return json_response({"ok": False, "error": "缺少 ip 参数"}, 400)
+        result = await self._cloud_blacklist_add(ip)
+        return json_response(result)
+
+    async def _api_cloud_blacklist_remove(self):
+        """从云端黑名单移除 IP。body: {"ip": "192.168.1."}"""
+        body = {}
+        try:
+            body = await request.json(default={}) or {}
+        except Exception:
+            body = {}
+        if not isinstance(body, dict):
+            body = {}
+        ip = str(body.get("ip", "") or "").strip()
+        if not ip:
+            return json_response({"ok": False, "error": "缺少 ip 参数"}, 400)
+        result = await self._cloud_blacklist_remove(ip)
+        return json_response(result)
+
+    async def _cloud_blacklist_list(self) -> dict:
+        """获取云端黑名单列表。"""
+        if not self._cloud_enabled():
+            return {"ok": False, "error": "云同步未启用"}
+        if not self._cloud_admin_token():
+            return {"ok": False, "error": "未配置 admin_token"}
+        try:
+            status, resp = await self._cloud_http_request(
+                "GET", "/api/blacklist", use_admin_token=True
+            )
+        except Exception as e:
+            self._cloud_record_error(f"blacklist_list: {e}")
+            return {"ok": False, "error": str(e)}
+        if status == 200:
+            return resp
+        msg = resp.get("error") or f"HTTP {status}"
+        self._cloud_record_error(f"blacklist_list: {msg}")
+        return {"ok": False, "error": msg}
+
+    async def _cloud_blacklist_add(self, ip: str) -> dict:
+        """添加 IP 到云端黑名单。"""
+        if not self._cloud_enabled():
+            return {"ok": False, "error": "云同步未启用"}
+        if not self._cloud_admin_token():
+            return {"ok": False, "error": "未配置 admin_token"}
+        try:
+            status, resp = await self._cloud_http_request(
+                "POST", "/api/blacklist/add", body={"ip": ip}, use_admin_token=True
+            )
+        except Exception as e:
+            self._cloud_record_error(f"blacklist_add: {e}")
+            return {"ok": False, "error": str(e)}
+        if status == 200 and resp.get("ok"):
+            logger.info(f"[恶意消息检测] IP 已加入黑名单: {ip}")
+            return resp
+        msg = resp.get("error") or f"HTTP {status}"
+        self._cloud_record_error(f"blacklist_add: {msg}")
+        return {"ok": False, "error": msg}
+
+    async def _cloud_blacklist_remove(self, ip: str) -> dict:
+        """从云端黑名单移除 IP。"""
+        if not self._cloud_enabled():
+            return {"ok": False, "error": "云同步未启用"}
+        if not self._cloud_admin_token():
+            return {"ok": False, "error": "未配置 admin_token"}
+        try:
+            status, resp = await self._cloud_http_request(
+                "POST", "/api/blacklist/remove", body={"ip": ip}, use_admin_token=True
+            )
+        except Exception as e:
+            self._cloud_record_error(f"blacklist_remove: {e}")
+            return {"ok": False, "error": str(e)}
+        if status == 200 and resp.get("ok"):
+            logger.info(f"[恶意消息检测] IP 已从黑名单移除: {ip}")
+            return resp
+        msg = resp.get("error") or f"HTTP {status}"
+        self._cloud_record_error(f"blacklist_remove: {msg}")
+        return {"ok": False, "error": msg}
+
     def _next_decay_seconds(self) -> int:
         last = float(self._meta.get("last_decrement", 0) or 0)
         if last <= 0:
@@ -2979,3 +3093,55 @@ class CheckMaliciousMessagePlugin(Star):
         if cloud.get("error"):
             lines.append(f"  ⚠️ 云端错误：{cloud.get('error')}")
         yield event.plain_result("\n".join(lines))
+
+    @filter.command("malicious_cloud_blacklist", alias={"云黑名单"})
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    async def malicious_cloud_blacklist(self, event: AstrMessageEvent):
+        """管理云端 IP 黑名单（管理员）。
+
+        用法：
+          云黑名单              → 查看黑名单列表
+          云黑名单 add <ip>     → 添加 IP 到黑名单
+          云黑名单 rm <ip>      → 从黑名单移除
+          云黑名单 list         → 查看黑名单列表
+        """
+        if not self._cloud_enabled():
+            yield event.plain_result("云同步未启用。")
+            return
+        args = str(event.message.message).strip().split()
+        if len(args) < 2:
+            yield event.plain_result("⚠️ 用法：\n  云黑名单 list          → 查看列表\n  云黑名单 add <ip>      → 添加\n  云黑名单 rm <ip>       → 移除")
+            return
+        action = args[1].lower()
+        if action == "list":
+            yield event.plain_result("⏳ 正在获取黑名单列表…")
+            result = await self._cloud_blacklist_list()
+            if not result.get("ok"):
+                yield event.plain_result(f"❌ 获取失败：{result.get('error', '未知错误')}")
+                return
+            items = result.get("items", []) or []
+            total = result.get("total", len(items))
+            if not items:
+                yield event.plain_result("📋 黑名单为空。")
+                return
+            lines = [f"📋 黑名单（共 {total} 条）："]
+            for i, ip in enumerate(items, 1):
+                lines.append(f"  {i}. {ip}")
+            yield event.plain_result("\n".join(lines))
+        elif action in ("add", "rm", "remove", "del"):
+            if len(args) < 3:
+                yield event.plain_result(f"⚠️ 请指定 IP：云黑名单 {action} <ip>")
+                return
+            ip = args[2]
+            op = "添加" if action == "add" else "移除"
+            yield event.plain_result(f"⏳ 正在{op} {ip}…")
+            if action == "add":
+                result = await self._cloud_blacklist_add(ip)
+            else:
+                result = await self._cloud_blacklist_remove(ip)
+            if not result.get("ok"):
+                yield event.plain_result(f"❌ {op}失败：{result.get('error', '未知错误')}")
+                return
+            yield event.plain_result(f"✅ {op}成功：{ip}")
+        else:
+            yield event.plain_result(f"⚠️ 未知操作：{action}\n用法：list / add <ip> / rm <ip>")
