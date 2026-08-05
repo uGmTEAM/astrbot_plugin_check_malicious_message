@@ -25,6 +25,72 @@ const paneCloud = document.getElementById("pane-cloud");
 let timer = null;
 let activeTab = "stats";
 
+// ---------------------------------------------------------------------------
+// 按键反馈：toast（屏幕中间正上方，持续 3 秒）
+// ---------------------------------------------------------------------------
+
+const toastBox = document.getElementById("toastBox");
+
+function toast(msg, type = "info", duration = 3000) {
+  if (!toastBox) return;
+  const el = document.createElement("div");
+  el.className = `toast toast-${type}`;
+  el.textContent = msg;
+  toastBox.appendChild(el);
+  // 触发进入动画
+  requestAnimationFrame(() => el.classList.add("show"));
+  setTimeout(() => {
+    el.classList.remove("show");
+    setTimeout(() => el.remove(), 300);
+  }, duration);
+}
+
+// ---------------------------------------------------------------------------
+// 自定义确认对话框（替代被 iframe 沙箱阻止的 confirm()）
+// ---------------------------------------------------------------------------
+
+const confirmModal = document.getElementById("confirmModal");
+const confirmText = document.getElementById("confirmText");
+const confirmOkBtn = document.getElementById("confirmOk");
+const confirmCancelBtn = document.getElementById("confirmCancel");
+
+function asyncConfirm(message, { okText = "确认", cancelText = "取消", danger = false } = {}) {
+  return new Promise((resolve) => {
+    if (!confirmModal || !confirmText) {
+      // 兜底：若无 modal 元素，直接放行
+      resolve(true);
+      return;
+    }
+    confirmText.textContent = message;
+    confirmOkBtn.textContent = okText;
+    confirmCancelBtn.textContent = cancelText;
+    confirmOkBtn.className = danger ? "btn danger" : "btn";
+    confirmModal.classList.add("show");
+
+    const cleanup = (val) => {
+      confirmModal.classList.remove("show");
+      confirmOkBtn.removeEventListener("click", onOk);
+      confirmCancelBtn.removeEventListener("click", onCancel);
+      confirmModal.removeEventListener("click", onBackdrop);
+      document.removeEventListener("keydown", onKey);
+      resolve(val);
+    };
+    const onOk = () => cleanup(true);
+    const onCancel = () => cleanup(false);
+    const onBackdrop = (e) => {
+      if (e.target === confirmModal) cleanup(false);
+    };
+    const onKey = (e) => {
+      if (e.key === "Escape") cleanup(false);
+      if (e.key === "Enter") cleanup(true);
+    };
+    confirmOkBtn.addEventListener("click", onOk);
+    confirmCancelBtn.addEventListener("click", onCancel);
+    confirmModal.addEventListener("click", onBackdrop);
+    document.addEventListener("keydown", onKey);
+  });
+}
+
 function escapeHtml(s) {
   return String(s ?? "")
     .replace(/&/g, "&amp;")
@@ -126,6 +192,7 @@ async function loadLogs() {
           ? `${escapeHtml(r.platform || "-")} · 私聊`
           : `${escapeHtml(r.platform || "-")} · 群 ${escapeHtml(r.group_id || "-")}`;
         const adminTag = r.is_admin ? ' <span class="badge admin">管理员</span>' : "";
+        const logId = escapeHtml(r.log_id || "");
         return `<tr>
           <td>${i + 1}</td>
           <td>${escapeHtml(r.time_str || "-")}</td>
@@ -138,9 +205,16 @@ async function loadLogs() {
           <td class="reason" title="${escapeHtml(r.reason)}">${escapeHtml(r.reason || "-")}</td>
           <td class="num"><span class="badge low">${r.count}</span></td>
           <td>${mutedTag}</td>
+          <td>
+            <button class="btn small danger" data-log-id="${logId}" data-action="revoke">撤回</button>
+          </td>
         </tr>`;
       })
       .join("");
+
+    logTbody.querySelectorAll('button[data-action="revoke"]').forEach((btn) => {
+      btn.addEventListener("click", () => revokeWarning(btn.dataset.logId, btn));
+    });
   } catch (e) {
     if (activeTab === "logs") {
       logEmptyEl.hidden = false;
@@ -192,10 +266,25 @@ async function loadSpecial() {
       .join("");
 
     specialTbody.querySelectorAll("button").forEach((btn) => {
-      btn.addEventListener("click", () => {
-        navigator.clipboard?.writeText(btn.dataset.msg);
-        btn.textContent = "已复制";
-        setTimeout(() => (btn.textContent = "复制"), 1500);
+      btn.addEventListener("click", async () => {
+        try {
+          if (navigator.clipboard?.writeText) {
+            await navigator.clipboard.writeText(btn.dataset.msg);
+          } else {
+            // iframe 中 clipboard 可能不可用，用临时 textarea 兜底
+            const ta = document.createElement("textarea");
+            ta.value = btn.dataset.msg;
+            ta.style.position = "fixed";
+            ta.style.opacity = "0";
+            document.body.appendChild(ta);
+            ta.select();
+            document.execCommand("copy");
+            ta.remove();
+          }
+          toast("已复制消息内容到剪贴板", "ok");
+        } catch (e) {
+          toast("复制失败：" + (e && e.message ? e.message : e), "error");
+        }
       });
     });
   } catch (e) {
@@ -258,12 +347,13 @@ async function loadTimeout() {
 }
 
 async function clearTimeoutArchive() {
-  if (!confirm("确认清空全部超时记录？此操作不可撤销。")) return;
+  if (!(await asyncConfirm("确认清空全部超时记录？此操作不可撤销。", { danger: true }))) return;
   try {
     await bridge.apiPost("timeout/clear", {});
+    toast("已清理全部超时记录", "ok");
     await loadTimeout();
   } catch (e) {
-    alert("清理失败：" + (e && e.message ? e.message : e));
+    toast("清理失败：" + (e && e.message ? e.message : e), "error");
   }
 }
 
@@ -281,17 +371,98 @@ async function load() {
   }
 }
 
-async function resetUser(key, btn) {
-  if (!confirm("确认将该用户的当前 x 重置为 0？")) return;
+async function resetUser(key, uid, btn) {
+  if (!(await asyncConfirm("确认将该用户的当前 x 重置为 0？", { danger: true }))) return;
   btn.disabled = true;
   try {
     await bridge.apiPost("reset", { key });
+    toast("已重置该用户的警告次数为 0", "ok");
     await load();
   } catch (e) {
-    alert("重置失败：" + (e && e.message ? e.message : e));
+    toast("重置失败：" + (e && e.message ? e.message : e), "error");
   } finally {
     btn.disabled = false;
   }
+}
+
+// ---------------------------------------------------------------------------
+// 误判撤回
+// ---------------------------------------------------------------------------
+
+async function revokeWarning(logId, btn) {
+  if (!logId) {
+    toast("该记录缺少 log_id，无法撤回", "error");
+    return;
+  }
+  const reason = await asyncPrompt("请输入误判理由（将标记此消息以免再次误判）：");
+  if (reason === null) return; // 取消
+  if (!reason.trim()) {
+    toast("误判理由不能为空", "error");
+    return;
+  }
+  btn.disabled = true;
+  try {
+    const res = await bridge.apiPost("revoke", { log_id: logId, reason: reason.trim() });
+    const data = res && res.data !== undefined ? res.data : res;
+    if (data && data.ok) {
+      toast(`✅ 已撤回：count ${data.old_count || 0} → ${data.new_count || 0}`, "ok");
+      if (data.cloud_revoked) {
+        toast("云端记录已同步撤回", "ok");
+      } else if (data.cloud_error) {
+        toast("云端撤回失败：" + data.cloud_error, "error", 5000);
+      }
+      await load();
+    } else {
+      toast("撤回失败：" + (data && data.error ? data.error : "未知错误"), "error");
+    }
+  } catch (e) {
+    toast("撤回失败：" + (e && e.message ? e.message : e), "error");
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+// 自定义输入对话框（替代 prompt()，同样可能被 iframe 沙箱阻止）
+const promptModal = document.getElementById("promptModal");
+const promptText = document.getElementById("promptText");
+const promptInput = document.getElementById("promptInput");
+const promptOkBtn = document.getElementById("promptOk");
+const promptCancelBtn = document.getElementById("promptCancel");
+
+function asyncPrompt(message, { placeholder = "", defaultVal = "" } = {}) {
+  return new Promise((resolve) => {
+    if (!promptModal || !promptInput) {
+      resolve(defaultVal);
+      return;
+    }
+    promptText.textContent = message;
+    promptInput.value = defaultVal;
+    promptInput.placeholder = placeholder;
+    promptModal.classList.add("show");
+    setTimeout(() => promptInput.focus(), 50);
+
+    const cleanup = (val) => {
+      promptModal.classList.remove("show");
+      promptOkBtn.removeEventListener("click", onOk);
+      promptCancelBtn.removeEventListener("click", onCancel);
+      promptModal.removeEventListener("click", onBackdrop);
+      document.removeEventListener("keydown", onKey);
+      resolve(val);
+    };
+    const onOk = () => cleanup(promptInput.value);
+    const onCancel = () => cleanup(null);
+    const onBackdrop = (e) => {
+      if (e.target === promptModal) cleanup(null);
+    };
+    const onKey = (e) => {
+      if (e.key === "Escape") cleanup(null);
+      if (e.key === "Enter") cleanup(promptInput.value);
+    };
+    promptOkBtn.addEventListener("click", onOk);
+    promptCancelBtn.addEventListener("click", onCancel);
+    promptModal.addEventListener("click", onBackdrop);
+    document.addEventListener("keydown", onKey);
+  });
 }
 
 refreshBtn.addEventListener("click", load);
@@ -364,6 +535,7 @@ async function loadCloud() {
     html += `&nbsp;&nbsp;• 同步禁言状态 (T/F): ${featureBadge(feat.sync_mute, feat.sync_mute ? "⚠️ 误禁言风险" : "")}<br>`;
     html += `&nbsp;&nbsp;• 删除云端记录: ${featureBadge(feat.delete_record, feat.delete_record ? "需 admin_token" : "")}<br>`;
     html += `&nbsp;&nbsp;• 上传特殊记录: ${featureBadge(feat.upload_special)}<br>`;
+    html += `&nbsp;&nbsp;• 误判撤回: ${featureBadge(feat.revoke)}<br>`;
     html += "<b>统计：</b><br>";
     html += `&nbsp;&nbsp;• 累计同步 ${stats.sync_count || 0} 次，推送 ${stats.push_count || 0} 次，拉取 ${stats.pull_count || 0} 次，错误 ${stats.error_count || 0} 次<br>`;
     html += `&nbsp;&nbsp;• 上次同步: ${escapeHtml(timing.last_sync_str || "-")} · 距下次同步: ${fmtCountdown(timing.next_sync_in || 0)}<br>`;
@@ -424,59 +596,60 @@ async function loadCloud() {
 }
 
 async function cloudSyncNow() {
-  if (!confirm("确认立即执行一次云同步（拉取 + 推送）？")) return;
+  if (!(await asyncConfirm("确认立即执行一次云同步（拉取 + 推送）？"))) return;
   try {
     cloudSummaryEl.textContent = "⏳ 正在同步…";
     const res = await bridge.apiPost("cloud/sync", {});
     const data = res && res.data !== undefined ? res.data : res;
     if (!data || !data.ok) {
-      alert("同步失败：" + (data && data.error ? data.error : "未知错误"));
+      toast("同步失败：" + (data && data.error ? data.error : "未知错误"), "error", 5000);
     } else {
       const pull = data.pull || {};
       const upload = data.upload || {};
       const inc = data.incremental || {};
       const special = data.special || {};
-      alert(`✅ 同步完成\n拉取: 记录 ${pull.pulled || 0} 条, 特殊 ${pull.special || 0} 条\n`
-        + `上传: 警告记录 ${upload.uploaded || 0} 条\n`
-        + `增量: 应用 ${inc.applied || 0} 条\n`
-        + `特殊: 上传 ${special.uploaded || 0} 条`);
+      toast(
+        `✅ 同步完成：拉取 ${pull.pulled || 0}/${pull.special || 0}，上传 ${upload.uploaded || 0}，增量 ${inc.applied || 0}，特殊 ${special.uploaded || 0}`,
+        "ok",
+        4000
+      );
     }
     await loadCloud();
   } catch (e) {
-    alert("同步失败：" + (e && e.message ? e.message : e));
+    toast("同步失败：" + (e && e.message ? e.message : e), "error", 5000);
     await loadCloud();
   }
 }
 
 async function cloudUploadRecords() {
-  if (!confirm("确认上传全部本地警告记录到云端？")) return;
+  if (!(await asyncConfirm("确认上传全部本地警告记录到云端？"))) return;
   try {
     const res = await bridge.apiPost("cloud/upload_record", {});
     const data = res && res.data !== undefined ? res.data : res;
     if (data && data.ok) {
-      alert(`✅ 上传成功: ${data.uploaded || 0} 条（云端共 ${data.total_cloud || 0} 条）`);
+      toast(`✅ 上传成功: ${data.uploaded || 0} 条（云端共 ${data.total_cloud || 0} 条）`, "ok");
     } else {
-      alert("上传失败：" + (data && data.error ? data.error : "未知错误"));
+      toast("上传失败：" + (data && data.error ? data.error : "未知错误"), "error");
     }
     await loadCloud();
   } catch (e) {
-    alert("上传失败：" + (e && e.message ? e.message : e));
+    toast("上传失败：" + (e && e.message ? e.message : e), "error");
   }
 }
 
 async function cloudUploadSpecial() {
-  if (!confirm("确认上传本地特殊记录到云端？")) return;
+  if (!(await asyncConfirm("确认上传本地特殊记录到云端？"))) return;
   try {
     const res = await bridge.apiPost("cloud/upload_special", { limit: 100 });
     const data = res && res.data !== undefined ? res.data : res;
     if (data && data.ok) {
-      alert(`✅ 上传成功: ${data.uploaded || 0} 条（云端共 ${data.total_cloud || 0} 条）`);
+      toast(`✅ 上传成功: ${data.uploaded || 0} 条（云端共 ${data.total_cloud || 0} 条）`, "ok");
     } else {
-      alert("上传失败：" + (data && data.error ? data.error : "未知错误"));
+      toast("上传失败：" + (data && data.error ? data.error : "未知错误"), "error");
     }
     await loadCloud();
   } catch (e) {
-    alert("上传失败：" + (e && e.message ? e.message : e));
+    toast("上传失败：" + (e && e.message ? e.message : e), "error");
   }
 }
 

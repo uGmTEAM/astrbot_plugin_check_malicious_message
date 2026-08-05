@@ -68,6 +68,7 @@
               <th>判定原因</th>
               <th class="num">x</th>
               <th>禁言</th>
+              <th>操作</th>
             </tr>
           </thead>
           <tbody id="logTbody"></tbody>
@@ -149,6 +150,32 @@
       </div>
       <p class="empty" id="cloudEmpty" hidden>云端暂无记录，或云同步未启用。</p>
     </section>
+
+    <!-- Toast 容器（屏幕中间正上方） -->
+    <div id="toastBox" class="toast-box"></div>
+
+    <!-- 自定义确认对话框 -->
+    <div id="confirmModal" class="modal-overlay">
+      <div class="modal-box">
+        <p id="confirmText" class="modal-text"></p>
+        <div class="modal-actions">
+          <button id="confirmCancel" class="btn small">取消</button>
+          <button id="confirmOk" class="btn">确认</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- 自定义输入对话框（用于误判撤回理由输入） -->
+    <div id="promptModal" class="modal-overlay">
+      <div class="modal-box">
+        <p id="promptText" class="modal-text"></p>
+        <input id="promptInput" type="text" class="modal-input" />
+        <div class="modal-actions">
+          <button id="promptCancel" class="btn small">取消</button>
+          <button id="promptOk" class="btn">确认</button>
+        </div>
+      </div>
+    </div>
 
     <script type="module" src="./app.js"></script>
   </body>
