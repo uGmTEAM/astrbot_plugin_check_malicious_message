@@ -1,5 +1,30 @@
 # 更新日志
 
+## v1.3.0 — 2026-08-05
+
+### 新增功能
+
+- **☁️ Web 管理器支持双 Token 登录与权限分级**：Web 可视化管理器现在支持使用 `admin_token` 或 `client_token` 登录，系统自动识别 Token 类型并提供不同的操作权限。
+  - **服务端**（`cloud_server/server.py`）：
+    - `POST /api/auth` 端点同时接受 `admin_token` 和 `client_token`，返回 `token_type` 字段（`"admin"` 或 `"client"`）；
+    - `GET /api/auth_check` 端点支持两种 Token 校验，返回对应的 `token_type`；
+    - 审计日志区分 `web_admin` 和 `web_client` 登录行为；
+    - 读端点（stats/records/special）保持兼容两种 Token，写端点（delete_record/audit_log/request_log）仅接受 `admin_token`；
+  - **前端**（`cloud_server/web/`）：
+    - 登录页支持两种 Token 输入，placeholder 更新为 `admin_token / client_token`；
+    - 登录成功后根据返回的 `token_type` 自动切换界面模式，顶部显示 Token 类型徽章（管理员/客户端）；
+    - **客户端模式**：隐藏所有删除操作按钮（包括批量删除、复选框、单条删除）、隐藏审计日志和请求日志标签页，仅保留查看和刷新功能；
+    - **管理员模式**：完整管理权限，可查看所有标签页、执行删除操作；
+    - 客户端模式下显示权限提示横幅；
+    - API 请求根据 Token 类型自动选择正确的请求头（`X-Admin-Token` 或 `X-Client-Token`）；
+    - 持久化 Token 和 Token 类型到 localStorage，自动登录时会从服务端再次校验类型；
+    - 将所有 `confirm()` 替换为 `asyncConfirm` 模态框（兼容 iframe 沙箱环境）。
+  - 新增样式：Token 类型徽章（管理员蓝色/客户端橙色）、客户端模式提示横幅、登录页权限说明。
+
+### 服务端版本同步
+
+- 服务端 `__VERSION__` 更新至 `1.3.0`。
+
 ## v1.2.1 — 2026-08-05
 
 ### 修复
@@ -15,9 +40,16 @@
   - 同时识别「连接被拒绝」错误，提示检查服务端启动状态/端口/防火墙；
   - `_conf_schema.json` 的 `cloud_server_url` 配置项 hint 中明确标注了协议一致性要求。
 
-- **云同步下次同步时间卡死**：修复云同步面板中「距下次同步」倒计时始终为 0、卡在"即将"的逻辑错误。
-  - 根因：`last_sync_ts` 仅在 `_cloud_full_sync` 完全成功（`try` 块末尾）时才更新。一旦同步因 SSL 错误等失败，`last_sync_ts` 永远停在初始值 0，`_cloud_next_sync_seconds` 始终返回 0，前端倒计时一直显示"即将"；
-  - 修复：在 `_cloud_full_sync` 开始同步**之前**就更新 `last_sync_ts`，确保即使同步失败也能正确计算下次倒计时；同步进行中时返回 0 表示当前正在同步。
+- **云同步下次同步时间卡死 + 自动同步失效**：修复云同步面板中「距下次同步」倒计时始终为 0、卡在"即将"且自动同步不触发的问题。
+  - 根因链：
+    1. `last_sync_ts` 仅在 `_cloud_full_sync` 完全成功（`try` 块末尾的 `_cloud_record_success("sync")`）时才更新；
+    2. 一旦同步因 SSL 协议不匹配等错误失败，`except` 分支只记录错误但**不更新 `last_sync_ts`**；
+    3. 同步失败后 `except` 分支也**不调用 `_save()`**，即使内存中时间戳有更新也不会持久化到磁盘；
+    4. 插件重载后 `last_sync_ts` 从持久化文件读回旧值 0，`_cloud_next_sync_seconds` 始终返回 0，前端倒计时永远显示"即将"。
+  - 修复：
+    - 在 `_cloud_full_sync` 开始同步**之前**就更新 `last_sync_ts`（内存）；
+    - 在 `except` 分支添加 `self._save()`，确保同步失败时内存中的时间戳和错误信息也会持久化到磁盘；
+    - `_cloud_next_sync_seconds` 增加 `_cloud_syncing` 判断，同步进行中返回 0。
 
 ### 备注
 

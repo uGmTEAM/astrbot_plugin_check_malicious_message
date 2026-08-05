@@ -2119,6 +2119,8 @@ class CheckMaliciousMessagePlugin(Star):
         except Exception as e:
             self._cloud_record_error(f"full_sync: {e}")
             logger.warning(f"[恶意消息检测] 云同步异常: {e}")
+            # 同步失败也持久化 last_sync_ts，避免重载后回到 0 导致倒计时卡死
+            self._save()
             return {"ok": False, "error": str(e)}
         finally:
             self._cloud_syncing = False
