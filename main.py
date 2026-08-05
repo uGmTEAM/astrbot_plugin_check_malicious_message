@@ -234,6 +234,12 @@ class CheckMaliciousMessagePlugin(Star):
             ["POST"],
             "向云端发送误判撤回请求（需 bot_id 一致）",
         )
+        self.context.register_web_api(
+            f"/{PLUGIN_NAME}/cloud/dedup",
+            self._api_cloud_dedup,
+            ["POST"],
+            "手动去重：清理僵尸记录 + 特殊记录指纹去重（需 admin_token）",
+        )
 
     # ------------------------------------------------------------------ 生命周期
 
@@ -2077,6 +2083,10 @@ class CheckMaliciousMessagePlugin(Star):
         if self._cloud_syncing:
             return {"ok": False, "error": "同步进行中，跳过本次"}
         self._cloud_syncing = True
+        # ★ 更新 attempt 时间戳（所有调用路径都会更新，确保倒计时正确）
+        now_ts = time.time()
+        self._cloud["last_attempt_ts"] = now_ts
+        self._save()
         try:
             # 1. 拉取（拉取本身不需要子开关，是否合并由 _cloud_apply_remote_records 控制）
             pull_result = await self._cloud_pull()
@@ -2144,14 +2154,12 @@ class CheckMaliciousMessagePlugin(Star):
                 last = float(self._cloud.get("last_attempt_ts", 0) or 0)
                 next_fire = last + interval
                 if next_fire <= now:
-                    # 已到期（可能是重载前就该同步了），立即执行
-                    # ★ 在调用 _cloud_full_sync 之前更新 last_attempt_ts
-                    #   确保即使 _cloud_full_sync 早返回（云未启用/同步中），
-                    #   也不会死循环（与 _do_decrement 无条件更新 last_decrement 一致）
-                    self._cloud["last_attempt_ts"] = now
-                    self._save()
-                    logger.info(f"[恶意消息检测] 云同步循环触发: attempt_at={self._fmt_ts(now)}, next_fire={next_fire}")
-                    await self._cloud_full_sync()
+                    # 已到期，执行同步
+                    logger.info(f"[恶意消息检测] 云同步循环触发: now={self._fmt_ts(now)}, next_fire={next_fire}")
+                    result = await self._cloud_full_sync()
+                    # 如果同步因 _cloud_syncing 被跳过，稍等后重试（避免 tight loop）
+                    if result.get("error") == "同步进行中，跳过本次":
+                        await asyncio.sleep(10)
                     continue  # 继续循环，重新计算下一次
                 # 等到下次同步时刻
                 wait = next_fire - time.time()
@@ -2624,6 +2632,83 @@ class CheckMaliciousMessagePlugin(Star):
         result = await self._cloud_revoke_record(key, log_id, message, reason)
         return json_response(result)
 
+    async def _api_cloud_dedup(self):
+        """手动去重：清理本地僵尸记录 + 调用云端去重。
+
+        body: {"type": "records"|"special"|""} 空=全部
+        """
+        body = {}
+        try:
+            body = await request.json(default={}) or {}
+        except Exception:
+            body = {}
+        if not isinstance(body, dict):
+            body = {}
+        dedup_type = str(body.get("type", "") or "")
+        result = await self._do_cloud_dedup(dedup_type)
+        return json_response(result)
+
+    async def _do_cloud_dedup(self, dedup_type: str = "") -> dict:
+        """执行去重逻辑（可被 API 和命令共同调用）。"""
+        result = {"ok": True, "local": {}, "cloud": {}}
+
+        # ---- 本地去重 ----
+        if dedup_type in ("", "records"):
+            now = time.time()
+            stale_threshold = 30 * 86400
+            removed_local = 0
+            for k, rec in list(self._records.items()):
+                count = int(rec.get("count", 0) or 0)
+                is_muted = bool(rec.get("is_muted", False))
+                last_warned = float(rec.get("last_warned", 0) or 0)
+                if count <= 0 and not is_muted and (now - last_warned) > stale_threshold:
+                    del self._records[k]
+                    removed_local += 1
+            if removed_local > 0:
+                self._save()
+            result["local"] = {
+                "removed": removed_local,
+                "total_after": len(self._records),
+            }
+
+        # ---- 云端去重 ----
+        if dedup_type in ("", "records", "special"):
+            cloud_result = await self._cloud_dedup(dedup_type)
+            result["cloud"] = cloud_result
+            if not cloud_result.get("ok"):
+                result["ok"] = False
+
+        # 清理空字段
+        if dedup_type == "records":
+            if "special" in result.get("cloud", {}):
+                del result["cloud"]["special"]
+        elif dedup_type == "special":
+            if "records" in result.get("cloud", {}):
+                del result["cloud"]["records"]
+
+        return result
+
+    async def _cloud_dedup(self, dedup_type: str = "") -> dict:
+        """调用云端 /api/dedup 端点执行去重。"""
+        if not self._cloud_enabled():
+            return {"ok": False, "error": "云同步未启用"}
+        if not self._cloud_admin_token():
+            return {"ok": False, "error": "未配置 admin_token"}
+        body = {"bot_id": self._cloud_bot_id(), "type": dedup_type}
+        try:
+            status, resp = await self._cloud_http_request(
+                "POST", "/api/dedup", body=body, use_admin_token=True
+            )
+        except Exception as e:
+            self._cloud_record_error(f"dedup: {e}")
+            return {"ok": False, "error": str(e)}
+        if status == 200 and resp.get("ok"):
+            logger.info(f"[恶意消息检测] 云同步去重完成: {resp}")
+            return resp
+        msg = resp.get("error") or f"HTTP {status}"
+        self._cloud_record_error(f"dedup: {msg}")
+        return {"ok": False, "error": msg}
+
     def _next_decay_seconds(self) -> int:
         last = float(self._meta.get("last_decrement", 0) or 0)
         if last <= 0:
@@ -2845,4 +2930,52 @@ class CheckMaliciousMessagePlugin(Star):
         ]
         if self._cloud.get("last_error"):
             lines.append(f"  ⚠️ 错误信息：{self._cloud.get('last_error')}")
+        yield event.plain_result("\n".join(lines))
+
+    @filter.command("malicious_cloud_dedup", alias={"云去重"})
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    async def malicious_cloud_dedup(self, event: AstrMessageEvent):
+        """手动去重：清理本地僵尸记录 + 云端去重（管理员）。
+
+        用法：
+          云去重           → 全部去重（记录+特殊）
+          云去重 records   → 仅记录去重
+          云去重 special   → 仅特殊去重
+        """
+        if not self._cloud_enabled():
+            yield event.plain_result("云同步未启用。")
+            return
+        # 解析参数
+        args = str(event.message.message).strip().split()
+        dedup_type = ""
+        if len(args) >= 2:
+            t = args[-1].lower()
+            if t in ("records", "special"):
+                dedup_type = t
+        type_label = {"": "全部", "records": "仅记录", "special": "仅特殊"}.get(dedup_type, "全部")
+        yield event.plain_result(f"⏳ 正在执行{type_label}去重…")
+        result = await self._do_cloud_dedup(dedup_type)
+        if not result.get("ok"):
+            yield event.plain_result(f"❌ 去重失败：{result.get('error', '未知错误')}")
+            return
+        local = result.get("local", {}) or {}
+        cloud = result.get("cloud", {}) or {}
+        cloud_records = cloud.get("records", {}) or {}
+        cloud_special = cloud.get("special", {}) or {}
+        lines = [
+            f"✅ 去重完成（{type_label}）：",
+            f"  本地：清理 {local.get('removed', 0)} 条僵尸记录，剩余 {local.get('total_after', 0)} 条",
+        ]
+        if dedup_type in ("", "records"):
+            lines.append(
+                f"  云端记录：清理 {cloud_records.get('removed', 0)} 条僵尸记录"
+                + (f"（{cloud_records.get('total_before', 0)}→{cloud_records.get('total_after', 0)}）" if cloud_records else "")
+            )
+        if dedup_type in ("", "special"):
+            lines.append(
+                f"  云端特殊：去重 {cloud_special.get('removed', 0)} 条重复"
+                + (f"（{cloud_special.get('total_before', 0)}→{cloud_special.get('total_after', 0)}）" if cloud_special else "")
+            )
+        if cloud.get("error"):
+            lines.append(f"  ⚠️ 云端错误：{cloud.get('error')}")
         yield event.plain_result("\n".join(lines))
