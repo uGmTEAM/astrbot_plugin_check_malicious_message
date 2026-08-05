@@ -1,0 +1,157 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>☁️ 恶意消息云同步管理器</title>
+    <link rel="stylesheet" href="./style.css" />
+  </head>
+  <body>
+    <!-- 登录页 -->
+    <div id="loginPage" class="login-page">
+      <div class="login-card">
+        <h1>☁️ 云同步管理器</h1>
+        <p class="sub">请输入 admin_token 登录管理后台</p>
+        <input id="tokenInput" type="password" placeholder="admin_token" />
+        <button id="loginBtn" class="btn">登录</button>
+        <p id="loginError" class="err" hidden></p>
+      </div>
+    </div>
+
+    <!-- 仪表盘 -->
+    <div id="dashboard" class="dashboard" hidden>
+      <header class="topbar">
+        <div class="title">
+          <span class="logo">☁️</span>
+          <h1>恶意消息云同步管理器</h1>
+        </div>
+        <div class="actions">
+          <button id="refreshBtn" class="btn small">🔄 刷新</button>
+          <button id="logoutBtn" class="btn small danger">退出登录</button>
+        </div>
+      </header>
+
+      <nav class="tabs">
+        <button class="tab active" data-tab="overview">📊 概览</button>
+        <button class="tab" data-tab="records">📋 警告记录</button>
+        <button class="tab" data-tab="special">🔴 特殊记录</button>
+        <button class="tab" data-tab="audit">📝 审计日志</button>
+        <button class="tab" data-tab="requests">🌐 请求日志</button>
+      </nav>
+
+      <!-- 概览 -->
+      <section id="pane-overview" class="pane">
+        <div id="overviewStats" class="stats-grid">加载中…</div>
+      </section>
+
+      <!-- 警告记录 -->
+      <section id="pane-records" class="pane" hidden>
+        <div class="toolbar">
+          <input id="recordSearch" type="text" placeholder="搜索 UID / 用户名 / 平台…" class="search" />
+          <button id="deleteSelectedBtn" class="btn small danger" disabled>删除选中</button>
+        </div>
+        <div class="table-wrap">
+          <table id="recordTable">
+            <thead>
+              <tr>
+                <th><input type="checkbox" id="selectAllRecords" /></th>
+                <th>用户</th>
+                <th>平台</th>
+                <th class="num">count</th>
+                <th class="num">total</th>
+                <th>禁言</th>
+                <th>最近原因</th>
+                <th>来源 bot</th>
+                <th>更新时间</th>
+                <th>操作</th>
+              </tr>
+            </thead>
+            <tbody id="recordTbody"></tbody>
+          </table>
+        </div>
+        <p class="empty" id="recordEmpty" hidden>暂无记录。</p>
+      </section>
+
+      <!-- 特殊记录 -->
+      <section id="pane-special" class="pane" hidden>
+        <div class="table-wrap">
+          <table id="specialTable">
+            <thead>
+              <tr>
+                <th>时间</th>
+                <th>用户</th>
+                <th>分类</th>
+                <th>平台</th>
+                <th>消息</th>
+                <th>原因</th>
+                <th>来源 bot</th>
+              </tr>
+            </thead>
+            <tbody id="specialTbody"></tbody>
+          </table>
+        </div>
+        <p class="empty" id="specialEmpty" hidden>暂无特殊记录。</p>
+      </section>
+
+      <!-- 审计日志 -->
+      <section id="pane-audit" class="pane" hidden>
+        <div class="toolbar">
+          <span class="hint">显示最近 500 条审计记录（撤回/删除/登录/上传等操作）</span>
+        </div>
+        <div class="table-wrap">
+          <table id="auditTable">
+            <thead>
+              <tr>
+                <th>时间</th>
+                <th>操作</th>
+                <th>操作者</th>
+                <th>详情</th>
+              </tr>
+            </thead>
+            <tbody id="auditTbody"></tbody>
+          </table>
+        </div>
+        <p class="empty" id="auditEmpty" hidden>暂无审计日志。</p>
+      </section>
+
+      <!-- 请求日志 -->
+      <section id="pane-requests" class="pane" hidden>
+        <div class="toolbar">
+          <span class="hint">显示最近 500 条 HTTP 请求记录</span>
+        </div>
+        <div class="table-wrap">
+          <table id="requestTable">
+            <thead>
+              <tr>
+                <th>时间</th>
+                <th>方法</th>
+                <th>路径</th>
+                <th class="num">状态</th>
+                <th>客户端</th>
+                <th>摘要</th>
+              </tr>
+            </thead>
+            <tbody id="requestTbody"></tbody>
+          </table>
+        </div>
+        <p class="empty" id="requestEmpty" hidden>暂无请求日志。</p>
+      </section>
+    </div>
+
+    <!-- Toast -->
+    <div id="toastBox" class="toast-box"></div>
+
+    <!-- 确认对话框 -->
+    <div id="confirmModal" class="modal-overlay">
+      <div class="modal-box">
+        <p id="confirmText" class="modal-text"></p>
+        <div class="modal-actions">
+          <button id="confirmCancel" class="btn small">取消</button>
+          <button id="confirmOk" class="btn danger">确认</button>
+        </div>
+      </div>
+    </div>
+
+    <script src="./app.js"></script>
+  </body>
+</html>
