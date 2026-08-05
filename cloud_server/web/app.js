@@ -145,6 +145,10 @@
     dedupBtns.forEach((el) => {
       el.style.display = isClient() ? "none" : "";
     });
+    // ★ 通用 data-admin-only 处理：client 模式隐藏所有标记为 admin-only 的元素
+    document.querySelectorAll("[data-admin-only]").forEach((el) => {
+      el.style.display = isClient() ? "none" : "";
+    });
     // client 模式：隐藏审计/请求日志/黑名单标签页（仅 admin 可用）
     const auditTab = document.querySelector('.tab[data-tab="audit"]');
     const requestsTab = document.querySelector('.tab[data-tab="requests"]');
@@ -164,12 +168,15 @@
     const paneMap = {
       overview: "pane-overview",
       records: "pane-records",
+      logs: "pane-logs",
       special: "pane-special",
       audit: "pane-audit",
       requests: "pane-requests",
+      blacklist: "pane-blacklist",
     };
     Object.entries(paneMap).forEach(([name, id]) => {
-      document.getElementById(id).hidden = name !== tabName;
+      const el = document.getElementById(id);
+      if (el) el.hidden = name !== tabName;
     });
     loadTab(tabName);
   }
@@ -236,6 +243,7 @@
   async function loadTab(tab) {
     if (tab === "overview") await loadOverview();
     else if (tab === "records") await loadRecords();
+    else if (tab === "logs") await loadLogs();
     else if (tab === "special") await loadSpecial();
     else if (tab === "audit") await loadAudit();
     else if (tab === "requests") await loadRequests();
@@ -347,13 +355,20 @@
       const sources = (r.sources || []).join(", ") || "-";
       const countBadge = r.count > 5 ? "high" : r.count > 0 ? "low" : "zero";
       const checkCol = canDelete ? `<td><input type="checkbox" class="rec-check" data-key="${key}" /></td>` : "";
+      // 操作列：admin 显示「清零」+「删除」；client 显示只读
       const actionCol = canDelete
-        ? `<td><button class="btn small danger" data-action="delete" data-key="${key}">删除</button></td>`
+        ? `<td>
+            <button class="btn small warning" data-action="zero" data-key="${key}">清零</button>
+            <button class="btn small danger" data-action="delete" data-key="${key}">删除</button>
+          </td>`
         : `<td><span class="hint">只读</span></td>`;
+      // 用户名可点击，弹出该用户的警告详情
+      const uid = escapeHtml(r.user_id || "");
+      const pid = escapeHtml(r.platform_id || "");
       return `<tr>
         ${checkCol}
         <td>
-          <div class="user">${escapeHtml(r.sender_name || r.user_id || "未知")}</div>
+          <div class="user clickable" data-user-id="${uid}" data-platform-id="${pid}">${escapeHtml(r.sender_name || r.user_id || "未知")}</div>
           <div class="uid">UID: ${escapeHtml(r.user_id || "-")}</div>
         </td>
         <td>${escapeHtml(r.platform || "-")}</td>
@@ -367,10 +382,19 @@
       </tr>`;
     }).join("");
 
-    // 绑定删除按钮（仅 admin）
+    // 绑定用户名点击 → 打开警告详情弹窗
+    tbody.querySelectorAll(".user.clickable").forEach((el) => {
+      el.addEventListener("click", () => {
+        openUserLogs(el.dataset.userId, el.dataset.platformId, el.textContent);
+      });
+    });
+    // 绑定删除/清零按钮（仅 admin）
     if (canDelete) {
       tbody.querySelectorAll('button[data-action="delete"]').forEach((btn) => {
         btn.addEventListener("click", () => deleteRecord(btn.dataset.key));
+      });
+      tbody.querySelectorAll('button[data-action="zero"]').forEach((btn) => {
+        btn.addEventListener("click", () => zeroCount(btn.dataset.key));
       });
       tbody.querySelectorAll(".rec-check").forEach((chk) => {
         chk.addEventListener("change", updateDeleteBtn);
@@ -389,6 +413,12 @@
     const checked = document.querySelectorAll(".rec-check:checked").length;
     deleteSelectedBtn.disabled = checked === 0;
     deleteSelectedBtn.textContent = checked > 0 ? `删除选中(${checked})` : "删除选中";
+    // 同步管理「清零选中」按钮状态
+    const zeroSelBtn = document.getElementById("zeroSelectedBtn");
+    if (zeroSelBtn) {
+      zeroSelBtn.disabled = checked === 0;
+      zeroSelBtn.textContent = checked > 0 ? `清零选中(${checked})` : "清零选中";
+    }
   }
 
   if (deleteSelectedBtn) {
@@ -633,6 +663,194 @@
   if (blacklistInput) {
     blacklistInput.addEventListener("keydown", (e) => {
       if (e.key === "Enter") blacklistAddBtn?.click();
+    });
+  }
+
+  // ---- 备案日志 ----
+  const logSearch = document.getElementById("logSearch");
+  let allLogs = [];
+
+  if (logSearch) {
+    logSearch.addEventListener("input", () => renderLogs());
+  }
+
+  async function loadLogs() {
+    const tbody = document.getElementById("logTbody");
+    const empty = document.getElementById("logEmpty");
+    try {
+      const data = await apiGet("/api/logs", { limit: 500 });
+      allLogs = data.items || [];
+      renderLogs();
+    } catch (e) {
+      toast("加载备案日志失败: " + e.message, "error");
+    }
+  }
+
+  function renderLogs() {
+    const tbody = document.getElementById("logTbody");
+    const empty = document.getElementById("logEmpty");
+    const q = (logSearch?.value || "").trim().toLowerCase();
+    let items = allLogs;
+    if (q) {
+      items = items.filter((l) =>
+        String(l.sender_name || "").toLowerCase().includes(q) ||
+        String(l.user_id || "").toLowerCase().includes(q) ||
+        String(l.message || "").toLowerCase().includes(q) ||
+        String(l.reason || "").toLowerCase().includes(q)
+      );
+    }
+    if (!items.length) {
+      tbody.innerHTML = "";
+      empty.hidden = false;
+      return;
+    }
+    empty.hidden = true;
+    tbody.innerHTML = items.map((l) => `
+      <tr>
+        <td>${escapeHtml(fmtTime(l.time))}</td>
+        <td>
+          <div class="user clickable" data-user-id="${escapeHtml(l.user_id || "")}" data-platform-id="${escapeHtml(l.platform_id || "")}">${escapeHtml(l.sender_name || l.user_id || "未知")}</div>
+          <div class="uid">UID: ${escapeHtml(l.user_id || "-")}</div>
+        </td>
+        <td>${escapeHtml(l.platform || "-")}</td>
+        <td class="msg" title="${escapeHtml(l.message)}">${escapeHtml(l.message || "-")}</td>
+        <td class="reason" title="${escapeHtml(l.reason)}">${escapeHtml(l.reason || "-")}</td>
+        <td class="num"><span class="badge low">${l.count || 0}</span></td>
+        <td><small>${escapeHtml(l.cloud_bot_id || "-")}</small></td>
+      </tr>
+    `).join("");
+
+    // 绑定用户名点击 → 打开警告详情弹窗
+    tbody.querySelectorAll(".user.clickable").forEach((el) => {
+      el.addEventListener("click", () => {
+        openUserLogs(el.dataset.userId, el.dataset.platformId, el.textContent);
+      });
+    });
+  }
+
+  // ---- 用户警告详情弹窗 ----
+  const userLogsModal = document.getElementById("userLogsModal");
+  const userLogsTitle = document.getElementById("userLogsTitle");
+  const userLogsBody = document.getElementById("userLogsBody");
+  const userLogsClose = document.getElementById("userLogsClose");
+
+  async function openUserLogs(uid, pid, userName) {
+    if (!uid) {
+      toast("该记录缺少 user_id，无法查看详情", "error");
+      return;
+    }
+    if (userLogsTitle) userLogsTitle.textContent = `用户 "${userName || uid}" 的警告详情`;
+    if (userLogsBody) userLogsBody.innerHTML = "<p class='hint'>加载中…</p>";
+    if (userLogsModal) userLogsModal.classList.add("show");
+    try {
+      const params = { user_id: uid, limit: 500 };
+      if (pid) params.platform_id = pid;
+      const data = await apiGet("/api/logs", params);
+      const items = data.items || [];
+      if (!items.length) {
+        userLogsBody.innerHTML = "<p class='empty'>该用户暂无警告记录。</p>";
+        return;
+      }
+      userLogsBody.innerHTML = `
+        <div class="user-logs-list">
+          ${items.map((l) => `
+            <div class="log-entry">
+              <div class="log-time">${escapeHtml(fmtTime(l.time))}</div>
+              <div class="log-message"><strong>消息:</strong> ${escapeHtml(l.message || "-")}</div>
+              <div class="log-reason"><strong>原因:</strong> ${escapeHtml(l.reason || "无")}</div>
+              <div class="log-meta">x=${l.count || 0} · ${escapeHtml(l.platform || "未知平台")}${l.cloud_bot_id ? " · 来源:" + escapeHtml(l.cloud_bot_id) : ""}</div>
+            </div>
+          `).join("")}
+        </div>
+      `;
+    } catch (e) {
+      userLogsBody.innerHTML = `<p class="err">加载失败: ${escapeHtml(e.message)}</p>`;
+    }
+  }
+
+  if (userLogsClose) {
+    userLogsClose.addEventListener("click", () => userLogsModal?.classList.remove("show"));
+  }
+  if (userLogsModal) {
+    userLogsModal.addEventListener("click", (e) => {
+      if (e.target === userLogsModal) userLogsModal.classList.remove("show");
+    });
+    document.addEventListener("keydown", (e) => {
+      if (e.key === "Escape" && userLogsModal.classList.contains("show")) {
+        userLogsModal.classList.remove("show");
+      }
+    });
+  }
+
+  // ---- 清零（管理员） ----
+  async function zeroCount(key) {
+    if (!isAdmin()) {
+      toast("客户端模式无此权限", "error");
+      return;
+    }
+    if (!(await asyncConfirm(`确认将该记录的警告次数清零？\nkey: ${key}\n此操作会强制下发到所有客户端。`))) return;
+    try {
+      const data = await apiPost("/api/zero_count", { keys: [key] });
+      if (data.ok) {
+        const z = (data.zeroed || [])[0];
+        toast(`已清零：count ${z?.old_count ?? 0} → 0`, "ok");
+        await loadRecords();
+        await loadOverview();
+      } else {
+        toast("清零失败: " + (data.error || "未知错误"), "error");
+      }
+    } catch (e) {
+      toast("清零失败: " + e.message, "error");
+    }
+  }
+
+  // 批量清零选中
+  const zeroSelectedBtn = document.getElementById("zeroSelectedBtn");
+  if (zeroSelectedBtn) {
+    zeroSelectedBtn.addEventListener("click", async () => {
+      if (!isAdmin()) {
+        toast("客户端模式无此权限", "error");
+        return;
+      }
+      const checked = Array.from(document.querySelectorAll(".rec-check:checked")).map((c) => c.dataset.key);
+      if (!checked.length) return;
+      if (!(await asyncConfirm(`确认将选中的 ${checked.length} 条记录全部清零？\n此操作会强制下发到所有客户端。`))) return;
+      try {
+        const data = await apiPost("/api/zero_count", { keys: checked });
+        if (data.ok) {
+          toast(`已清零 ${data.zeroed?.length || 0} 条记录`, "ok");
+          await loadRecords();
+          await loadOverview();
+        } else {
+          toast("批量清零失败: " + (data.error || "未知错误"), "error");
+        }
+      } catch (e) {
+        toast("批量清零失败: " + e.message, "error");
+      }
+    });
+  }
+
+  // ---- 删除7天前日志（管理员） ----
+  const deleteOldLogsBtn = document.getElementById("deleteOldLogsBtn");
+  if (deleteOldLogsBtn) {
+    deleteOldLogsBtn.addEventListener("click", async () => {
+      if (!isAdmin()) {
+        toast("客户端模式无此权限", "error");
+        return;
+      }
+      if (!(await asyncConfirm("确认删除存放超过 7 天的备案日志？\n此操作不可恢复。"))) return;
+      try {
+        const data = await apiPost("/api/delete_old_logs", { days: 7 });
+        if (data.ok) {
+          toast(`已删除 ${data.removed || 0} 条旧日志，剩余 ${data.remaining || 0} 条`, "ok");
+          await loadLogs();
+          await loadOverview();
+        } else {
+          toast("删除失败: " + (data.error || "未知错误"), "error");
+        }
+      } catch (e) {
+        toast("删除失败: " + e.message, "error");
+      }
     });
   }
 

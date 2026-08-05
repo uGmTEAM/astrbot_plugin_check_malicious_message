@@ -345,6 +345,90 @@ tr:hover td { background: #fafbff; }
   gap: 10px;
 }
 
+/* ---- 用户警告详情弹窗（宽版） ---- */
+.modal-box-wide {
+  min-width: 480px;
+  max-width: min(800px, 92vw);
+  max-height: 80vh;
+  display: flex;
+  flex-direction: column;
+}
+
+.modal-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 14px;
+  padding-bottom: 10px;
+  border-bottom: 1px solid var(--border);
+}
+
+.modal-header h3 {
+  margin: 0;
+  font-size: 16px;
+  color: var(--text);
+}
+
+.user-logs-body {
+  overflow-y: auto;
+  max-height: calc(80vh - 80px);
+  padding-right: 4px;
+}
+
+.user-logs-list {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.log-entry {
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 10px 12px;
+  font-size: 13px;
+  line-height: 1.6;
+}
+
+.log-entry .log-time {
+  color: var(--muted);
+  font-size: 12px;
+  margin-bottom: 4px;
+}
+
+.log-entry .log-message,
+.log-entry .log-reason {
+  word-break: break-all;
+  margin: 2px 0;
+}
+
+.log-entry .log-meta {
+  color: var(--muted);
+  font-size: 12px;
+  margin-top: 4px;
+}
+
+/* 可点击用户名 */
+.user.clickable {
+  cursor: pointer;
+  color: var(--primary);
+  text-decoration: none;
+  transition: color 0.15s;
+}
+
+.user.clickable:hover {
+  text-decoration: underline;
+  color: var(--primary-dark, #2563eb);
+}
+
+/* 备案日志表格消息列 */
+td.msg {
+  max-width: 320px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 /* ---- Token 类型徽章 ---- */
 .token-badge {
   display: inline-block;

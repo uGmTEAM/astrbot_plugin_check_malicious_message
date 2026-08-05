@@ -39,7 +39,8 @@
 
       <nav class="tabs">
         <button class="tab active" data-tab="overview">📊 概览</button>
-        <button class="tab" data-tab="records">📋 警告记录</button>
+        <button class="tab" data-tab="records">📋 警告次数统计</button>
+        <button class="tab" data-tab="logs">📄 备案</button>
         <button class="tab" data-tab="special">🔴 特殊记录</button>
         <button class="tab" data-tab="audit">📝 审计日志</button>
         <button class="tab" data-tab="requests">🌐 请求日志</button>
@@ -51,13 +52,15 @@
         <div id="overviewStats" class="stats-grid">加载中…</div>
       </section>
 
-      <!-- 警告记录 -->
+      <!-- 警告次数统计 -->
       <section id="pane-records" class="pane" hidden>
         <div class="toolbar">
           <input id="recordSearch" type="text" placeholder="搜索 UID / 用户名 / 平台…" class="search" />
-          <button id="dedupRecordsBtn" class="btn small" data-action="dedup" style="display:none">🧹 去重</button>
-          <button id="deleteSelectedBtn" class="btn small danger" disabled>删除选中</button>
+          <button id="dedupRecordsBtn" class="btn small" data-action="dedup" data-admin-only style="display:none">🧹 去重</button>
+          <button id="zeroSelectedBtn" class="btn small warning" data-admin-only style="display:none">清零选中</button>
+          <button id="deleteSelectedBtn" class="btn small danger" data-admin-only disabled>删除选中</button>
         </div>
+        <p class="hint">点击用户名可查看该用户每次被警告的句子与原因。</p>
         <div class="table-wrap">
           <table id="recordTable">
             <thead>
@@ -78,6 +81,32 @@
           </table>
         </div>
         <p class="empty" id="recordEmpty" hidden>暂无记录。</p>
+      </section>
+
+      <!-- 备案（个体警告事件） -->
+      <section id="pane-logs" class="pane" hidden>
+        <div class="toolbar">
+          <input id="logSearch" type="text" placeholder="搜索用户 / 消息 / 原因…" class="search" />
+          <button id="deleteOldLogsBtn" class="btn small danger" data-admin-only style="display:none">🗑 删除7天前日志</button>
+        </div>
+        <p class="hint">显示每次警告的句子与原因。管理员可删除存放超过 7 天的日志。</p>
+        <div class="table-wrap">
+          <table id="logTable">
+            <thead>
+              <tr>
+                <th>时间</th>
+                <th>用户</th>
+                <th>平台</th>
+                <th>消息</th>
+                <th>原因</th>
+                <th class="num">x</th>
+                <th>来源</th>
+              </tr>
+            </thead>
+            <tbody id="logTbody"></tbody>
+          </table>
+        </div>
+        <p class="empty" id="logEmpty" hidden>暂无备案日志。</p>
       </section>
 
       <!-- 特殊记录 -->
@@ -182,6 +211,17 @@
           <button id="confirmCancel" class="btn small">取消</button>
           <button id="confirmOk" class="btn danger">确认</button>
         </div>
+      </div>
+    </div>
+
+    <!-- 用户警告详情弹窗 -->
+    <div id="userLogsModal" class="modal-overlay">
+      <div class="modal-box modal-box-wide">
+        <div class="modal-header">
+          <h3 id="userLogsTitle">警告详情</h3>
+          <button id="userLogsClose" class="btn small">✕ 关闭</button>
+        </div>
+        <div id="userLogsBody" class="user-logs-body">加载中…</div>
       </div>
     </div>
 
