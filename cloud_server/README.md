@@ -21,9 +21,10 @@ cloud_server/
 │   └── style.css                # 管理器样式
 ├── data/                        # 数据目录（自动创建）
 │   ├── records.json             # 警告记录存储
-│   └── special_records.json     # 特殊记录存储
+│   ├── special_records.json     # 特殊记录存储
+│   └── blacklist.json           # IP 黑名单存储
 └── logs/                        # 日志目录（自动创建）
-    ├── audit.log.jsonl          # 审计日志（删除/同步/撤回/登录操作）
+    ├── audit.log.jsonl          # 审计日志（删除/同步/撤回/登录/去重操作）
     └── request.log.jsonl        # 请求日志
 ```
 
@@ -31,12 +32,13 @@ cloud_server/
 
 启动服务端后，浏览器访问 `http://your-server:8765/` 即可进入管理后台：
 
-1. **无 Token 自动进入登录页**，输入 `admin_token` 登录（Token 存储在浏览器 localStorage）；
+1. **输入 Token 登录**，系统自动识别 Token 类型（管理员/客户端）；
 2. **📊 概览**：记录总数、特殊记录数、禁言中用户、高风险用户、贡献 Bot 列表、运行时长；
-3. **📋 警告记录**：搜索（UID/用户名/平台）、批量删除（复选框）、单条删除；
-4. **🔴 特殊记录**：按人分类查看政治敏感/违法内容；
+3. **📋 警告记录**：搜索（UID/用户名/平台）、批量删除（复选框）、单条删除、手动去重；
+4. **🔴 特殊记录**：按人分类查看政治敏感/违法内容、手动去重；
 5. **📝 审计日志**：查看最近 500 条审计记录（撤回/删除/登录/上传/同步等操作）；
-6. **🌐 请求日志**：查看最近 500 条 HTTP 请求记录。
+6. **🌐 请求日志**：查看最近 500 条 HTTP 请求记录；
+7. **🚫 IP 黑名单**（仅管理员）：添加/移除 IP 黑名单，被拉黑 IP 无法访问服务。
 
 > 管理器前端文件位于 `web/` 目录，由服务端自动提供，无需额外配置。
 
@@ -268,6 +270,37 @@ GET /api/special?limit=500
 Header: X-Client-Token: <client_token>
 ```
 
+### 10. 手动去重（管理员）
+```
+POST /api/dedup
+Header: X-Admin-Token: <admin_token>
+Body:
+{
+  "bot_id": "admin",
+  "type": ""  // 空=全部, "records"=仅记录, "special"=仅特殊
+}
+```
+- `records` 类型：清理 `count=0`、未禁言、`last_warned` 超过 30 天的僵尸记录；
+- `special` 类型：按指纹去重，保留首次出现，移除重复项（不删除非重复记录）。
+
+### 11. IP 黑名单管理（管理员）
+```
+# 查看黑名单
+GET /api/blacklist
+Header: X-Admin-Token: <admin_token>
+
+# 添加 IP 到黑名单
+POST /api/blacklist/add
+Header: X-Admin-Token: <admin_token>
+Body: {"ip": "192.168.1."}  // 支持精确匹配或前缀匹配
+
+# 从黑名单移除
+POST /api/blacklist/remove
+Header: X-Admin-Token: <admin_token>
+Body: {"ip": "192.168.1."}
+```
+被拉黑的 IP 访问任何端点（除 `/api/health` 外）将返回 HTTP 403 和文本「你的IP已被拉黑，无法访问此服务。」。
+
 ## 安全建议
 
 1. **修改默认 Token**：`config.json` 中的 `CHANGE_ME_*` 必须替换为强随机字符串。
@@ -324,8 +357,8 @@ sudo systemctl restart malicious-cloud
 
 ## 版本
 
-- 服务端版本：1.3.0
-- 配套插件版本：>= 1.3.0
+- 服务端版本：1.3.1
+- 配套插件版本：>= 1.3.1
 
 ## 反馈
 

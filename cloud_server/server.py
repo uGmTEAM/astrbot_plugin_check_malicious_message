@@ -31,7 +31,7 @@ from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
-__VERSION__ = "1.3.0"
+__VERSION__ = "1.3.1"
 CONFIG_PATH_DEFAULT = "config.json"
 RECORDS_FILE = "records.json"
 SPECIAL_FILE = "special_records.json"
