@@ -1805,10 +1805,11 @@ class CheckMaliciousMessagePlugin(Star):
             return {"ok": False, "error": str(e), "uploaded": 0, "skipped": skipped, "status": 0}
         if status == 200 and resp.get("ok"):
             uploaded = int(resp.get("uploaded", 0))
+            server_skipped = int(resp.get("skipped", 0))
             self._cloud_record_success("push", last_uploaded_records=uploaded)
             self._cloud["last_pulled_records"] = int(resp.get("total_cloud", 0))
-            logger.info(f"[恶意消息检测] 云同步上传 {uploaded} 条记录成功")
-            return {"ok": True, "uploaded": uploaded, "skipped": skipped, "status": status,
+            logger.info(f"[恶意消息检测] 云同步上传 {uploaded} 条记录成功（跳过 {server_skipped} 条重复）")
+            return {"ok": True, "uploaded": uploaded, "skipped": server_skipped, "status": status,
                     "total_cloud": resp.get("total_cloud", 0)}
         msg = resp.get("error") or f"HTTP {status}"
         self._cloud_record_error(f"upload_record: {msg}")
@@ -1850,8 +1851,10 @@ class CheckMaliciousMessagePlugin(Star):
             return {"ok": False, "error": str(e), "uploaded": 0, "status": 0}
         if status == 200 and resp.get("ok"):
             uploaded = int(resp.get("uploaded", 0))
+            server_skipped = int(resp.get("skipped", 0))
             self._cloud_record_success("push", last_uploaded_records=uploaded)
-            return {"ok": True, "uploaded": uploaded, "status": status,
+            logger.info(f"[恶意消息检测] 云同步上传特殊记录 {uploaded} 条（跳过 {server_skipped} 条重复）")
+            return {"ok": True, "uploaded": uploaded, "skipped": server_skipped, "status": status,
                     "total_cloud": resp.get("total_cloud", 0)}
         msg = resp.get("error") or f"HTTP {status}"
         self._cloud_record_error(f"upload_special: {msg}")
@@ -2827,13 +2830,17 @@ class CheckMaliciousMessagePlugin(Star):
             "✅ 云同步完成：",
             f"  拉取：记录 {pull.get('pulled', 0)} 条，特殊 {pull.get('special', 0)} 条",
             f"  上传：警告记录 {upload.get('uploaded', 0)} 条" + (
-                f"（云端共 {upload.get('total_cloud', 0)} 条）" if upload.get("total_cloud") else ""
+                f"（跳过 {upload.get('skipped', 0)} 条重复" if upload.get('skipped', 0) > 0 else ""
+            ) + (
+                f"，云端共 {upload.get('total_cloud', 0)} 条）" if upload.get('total_cloud') else "）"
             ),
             f"  增量：应用 {inc.get('applied', 0)} 条" + (
-                f"（{inc.get('skipped', '')}）" if inc.get("skipped") else ""
+                f"（跳过 {inc.get('skipped', 0)} 条）" if inc.get('skipped', 0) else ""
             ),
             f"  特殊：上传 {special.get('uploaded', 0)} 条" + (
-                f"（云端共 {special.get('total_cloud', 0)} 条）" if special.get("total_cloud") else ""
+                f"（跳过 {special.get('skipped', 0)} 条重复" if special.get('skipped', 0) > 0 else ""
+            ) + (
+                f"，云端共 {special.get('total_cloud', 0)} 条）" if special.get('total_cloud') else "）"
             ),
         ]
         if self._cloud.get("last_error"):
