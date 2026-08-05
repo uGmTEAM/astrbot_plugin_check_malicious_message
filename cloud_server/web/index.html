@@ -11,10 +11,11 @@
     <div id="loginPage" class="login-page">
       <div class="login-card">
         <h1>☁️ 云同步管理器</h1>
-        <p class="sub">请输入 admin_token 登录管理后台</p>
-        <input id="tokenInput" type="password" placeholder="admin_token" />
+        <p class="sub">请输入 token 登录（支持 admin_token 或 client_token）</p>
+        <input id="tokenInput" type="password" placeholder="admin_token / client_token" />
         <button id="loginBtn" class="btn">登录</button>
         <p id="loginError" class="err" hidden></p>
+        <p class="login-hint">admin_token：完整管理权限<br>client_token：只读权限（查看数据、刷新）</p>
       </div>
     </div>
 
@@ -24,12 +25,18 @@
         <div class="title">
           <span class="logo">☁️</span>
           <h1>恶意消息云同步管理器</h1>
+          <span id="tokenTypeBadge" class="token-badge" hidden></span>
         </div>
         <div class="actions">
           <button id="refreshBtn" class="btn small">🔄 刷新</button>
           <button id="logoutBtn" class="btn small danger">退出登录</button>
         </div>
       </header>
+
+      <!-- client 模式提示 -->
+      <div id="clientNotice" class="client-notice" hidden>
+        🔒 当前为客户端模式，仅可查看数据。如需删除记录或查看日志，请使用 admin_token 登录。
+      </div>
 
       <nav class="tabs">
         <button class="tab active" data-tab="overview">📊 概览</button>

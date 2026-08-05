@@ -2,9 +2,14 @@
 (() => {
   "use strict";
 
-  const TOKEN_KEY = "malicious_cloud_admin_token";
+  const TOKEN_KEY = "malicious_cloud_token";
+  const TOKEN_TYPE_KEY = "malicious_cloud_token_type";
   let token = localStorage.getItem(TOKEN_KEY) || "";
+  let tokenType = localStorage.getItem(TOKEN_TYPE_KEY) || "";  // "admin" or "client"
   let activeTab = "overview";
+
+  const isAdmin = () => tokenType === "admin";
+  const isClient = () => tokenType === "client";
 
   // ---- DOM ----
   const loginPage = document.getElementById("loginPage");
@@ -20,6 +25,8 @@
   const confirmText = document.getElementById("confirmText");
   const confirmOk = document.getElementById("confirmOk");
   const confirmCancel = document.getElementById("confirmCancel");
+  const tokenTypeBadge = document.getElementById("tokenTypeBadge");
+  const clientNotice = document.getElementById("clientNotice");
 
   // ---- Toast ----
   function toast(msg, type = "info", duration = 3000) {
@@ -63,15 +70,19 @@
   }
 
   // ---- API 调用 ----
+  function _authHeader() {
+    return isAdmin() ? "X-Admin-Token" : "X-Client-Token";
+  }
+
   async function apiGet(path, params) {
     const url = new URL(path, window.location.origin);
     if (params) {
       Object.entries(params).forEach(([k, v]) => url.searchParams.set(k, v));
     }
     const resp = await fetch(url.toString(), {
-      headers: { "X-Admin-Token": token },
+      headers: { [_authHeader()]: token },
     });
-    if (resp.status === 401) {
+    if (resp.status === 401 || resp.status === 403) {
       logout();
       throw new Error("未授权，请重新登录");
     }
@@ -83,11 +94,11 @@
       method: "POST",
       headers: {
         "Content-Type": "application/json",
-        "X-Admin-Token": token,
+        [_authHeader()]: token,
       },
       body: JSON.stringify(body || {}),
     });
-    if (resp.status === 401) {
+    if (resp.status === 401 || resp.status === 403) {
       logout();
       throw new Error("未授权，请重新登录");
     }
@@ -105,12 +116,64 @@
   function showDashboard() {
     loginPage.style.display = "none";
     dashboard.hidden = false;
+    applyTokenTypeUI();
     loadAll();
+  }
+
+  function applyTokenTypeUI() {
+    // 更新 token 类型徽章
+    if (tokenTypeBadge) {
+      tokenTypeBadge.textContent = isAdmin() ? "管理员" : "客户端";
+      tokenTypeBadge.className = "token-badge " + (isAdmin() ? "token-admin" : "token-client");
+      tokenTypeBadge.hidden = false;
+    }
+    // client 模式：显示受限提示
+    if (clientNotice) {
+      clientNotice.hidden = !isClient();
+    }
+    // client 模式：隐藏所有删除/操作按钮
+    const actionBtns = document.querySelectorAll("[data-action='delete'], .rec-check, #deleteSelectedBtn, #selectAllRecords");
+    actionBtns.forEach((el) => {
+      if (isClient()) {
+        el.style.display = "none";
+      } else {
+        el.style.display = "";
+      }
+    });
+    // client 模式：隐藏审计/请求日志标签页（仅 admin 可用）
+    const auditTab = document.querySelector('.tab[data-tab="audit"]');
+    const requestsTab = document.querySelector('.tab[data-tab="requests"]');
+    if (auditTab) auditTab.style.display = isClient() ? "none" : "";
+    if (requestsTab) requestsTab.style.display = isClient() ? "none" : "";
+    // 如果当前 tab 是受限的，切回 overview
+    if (isClient() && (activeTab === "audit" || activeTab === "requests")) {
+      switchTab("overview");
+    }
+  }
+
+  function switchTab(tabName) {
+    activeTab = tabName;
+    tabs.forEach((t) => t.classList.toggle("active", t.dataset.tab === tabName));
+    const paneMap = {
+      overview: "pane-overview",
+      records: "pane-records",
+      special: "pane-special",
+      audit: "pane-audit",
+      requests: "pane-requests",
+    };
+    Object.entries(paneMap).forEach(([name, id]) => {
+      document.getElementById(id).hidden = name !== tabName;
+    });
+    loadTab(tabName);
   }
 
   function logout() {
     token = "";
+    tokenType = "";
     localStorage.removeItem(TOKEN_KEY);
+    localStorage.removeItem(TOKEN_TYPE_KEY);
+    if (tokenTypeBadge) tokenTypeBadge.hidden = true;
+    if (clientNotice) clientNotice.hidden = true;
     showLogin();
   }
 
@@ -118,7 +181,7 @@
     const t = tokenInput.value.trim();
     if (!t) {
       loginError.hidden = false;
-      loginError.textContent = "请输入 admin_token";
+      loginError.textContent = "请输入 admin_token 或 client_token";
       return;
     }
     loginBtn.disabled = true;
@@ -131,9 +194,11 @@
       const data = await resp.json();
       if (resp.ok && data.ok) {
         token = t;
+        tokenType = data.token_type || "admin";
         localStorage.setItem(TOKEN_KEY, t);
+        localStorage.setItem(TOKEN_TYPE_KEY, tokenType);
         loginError.hidden = true;
-        toast("登录成功", "ok");
+        toast(`登录成功（${isAdmin() ? "管理员" : "客户端"}模式）`, "ok");
         showDashboard();
       } else {
         loginError.hidden = false;
@@ -151,30 +216,14 @@
   tokenInput.addEventListener("keydown", (e) => {
     if (e.key === "Enter") login();
   });
-  logoutBtn.addEventListener("click", () => {
-    if (confirm("确认退出登录？")) logout();
+  logoutBtn.addEventListener("click", async () => {
+    if (await asyncConfirm("确认退出登录？")) logout();
   });
   refreshBtn.addEventListener("click", loadAll);
 
   // ---- Tab 切换 ----
-  const paneMap = {
-    overview: "pane-overview",
-    records: "pane-records",
-    special: "pane-special",
-    audit: "pane-audit",
-    requests: "pane-requests",
-  };
-
   tabs.forEach((tab) => {
-    tab.addEventListener("click", () => {
-      tabs.forEach((t) => t.classList.remove("active"));
-      tab.classList.add("active");
-      activeTab = tab.dataset.tab;
-      Object.entries(paneMap).forEach(([name, id]) => {
-        document.getElementById(id).hidden = name !== activeTab;
-      });
-      loadTab(activeTab);
-    });
+    tab.addEventListener("click", () => switchTab(tab.dataset.tab));
   });
 
   async function loadTab(tab) {
@@ -280,6 +329,7 @@
       return;
     }
     empty.hidden = true;
+    const canDelete = isAdmin();
     tbody.innerHTML = items.map((r) => {
       const key = escapeHtml(r.key || "");
       const muted = r.is_muted;
@@ -288,8 +338,12 @@
         : `<span class="badge zero">未禁言</span>`;
       const sources = (r.sources || []).join(", ") || "-";
       const countBadge = r.count > 5 ? "high" : r.count > 0 ? "low" : "zero";
+      const checkCol = canDelete ? `<td><input type="checkbox" class="rec-check" data-key="${key}" /></td>` : "";
+      const actionCol = canDelete
+        ? `<td><button class="btn small danger" data-action="delete" data-key="${key}">删除</button></td>`
+        : `<td><span class="hint">只读</span></td>`;
       return `<tr>
-        <td><input type="checkbox" class="rec-check" data-key="${key}" /></td>
+        ${checkCol}
         <td>
           <div class="user">${escapeHtml(r.sender_name || r.user_id || "未知")}</div>
           <div class="uid">UID: ${escapeHtml(r.user_id || "-")}</div>
@@ -301,46 +355,63 @@
         <td class="reason" title="${escapeHtml(r.last_reason)}">${escapeHtml(r.last_reason || "-")}</td>
         <td><small>${escapeHtml(sources)}</small></td>
         <td>${escapeHtml(fmtTime(r.updated_at))}</td>
-        <td>
-          <button class="btn small danger" data-action="delete" data-key="${key}">删除</button>
-        </td>
+        ${actionCol}
       </tr>`;
     }).join("");
 
-    // 绑定删除按钮
-    tbody.querySelectorAll('button[data-action="delete"]').forEach((btn) => {
-      btn.addEventListener("click", () => deleteRecord(btn.dataset.key));
-    });
-    // 绑定复选框
-    tbody.querySelectorAll(".rec-check").forEach((chk) => {
-      chk.addEventListener("change", updateDeleteBtn);
-    });
+    // 绑定删除按钮（仅 admin）
+    if (canDelete) {
+      tbody.querySelectorAll('button[data-action="delete"]').forEach((btn) => {
+        btn.addEventListener("click", () => deleteRecord(btn.dataset.key));
+      });
+      tbody.querySelectorAll(".rec-check").forEach((chk) => {
+        chk.addEventListener("change", updateDeleteBtn);
+      });
+    }
+    updateDeleteBtn();
   }
 
   function updateDeleteBtn() {
+    if (!deleteSelectedBtn) return;
+    if (!isAdmin()) {
+      deleteSelectedBtn.disabled = true;
+      deleteSelectedBtn.textContent = "删除选中";
+      return;
+    }
     const checked = document.querySelectorAll(".rec-check:checked").length;
     deleteSelectedBtn.disabled = checked === 0;
     deleteSelectedBtn.textContent = checked > 0 ? `删除选中(${checked})` : "删除选中";
   }
 
-  deleteSelectedBtn.addEventListener("click", async () => {
-    const checked = Array.from(document.querySelectorAll(".rec-check:checked")).map((c) => c.dataset.key);
-    if (!checked.length) return;
-    if (!(await asyncConfirm(`确认删除选中的 ${checked.length} 条记录？此操作不可恢复。`))) return;
-    try {
-      const data = await apiPost("/api/delete_record", { keys: checked });
-      if (data.ok) {
-        toast(`已删除 ${data.deleted_count || 0} 条记录`, "ok");
-        await loadRecords();
-      } else {
-        toast("删除失败: " + (data.error || "未知错误"), "error");
+  if (deleteSelectedBtn) {
+    deleteSelectedBtn.addEventListener("click", async () => {
+      if (!isAdmin()) {
+        toast("客户端模式无此权限", "error");
+        return;
       }
-    } catch (e) {
-      toast("删除失败: " + e.message, "error");
-    }
-  });
+      const checked = Array.from(document.querySelectorAll(".rec-check:checked")).map((c) => c.dataset.key);
+      if (!checked.length) return;
+      if (!(await asyncConfirm(`确认删除选中的 ${checked.length} 条记录？此操作不可恢复。`))) return;
+      try {
+        const data = await apiPost("/api/delete_record", { keys: checked });
+        if (data.ok) {
+          toast(`已删除 ${data.deleted_count || 0} 条记录`, "ok");
+          await loadRecords();
+          await loadOverview();
+        } else {
+          toast("删除失败: " + (data.error || "未知错误"), "error");
+        }
+      } catch (e) {
+        toast("删除失败: " + e.message, "error");
+      }
+    });
+  }
 
   async function deleteRecord(key) {
+    if (!isAdmin()) {
+      toast("客户端模式无此权限", "error");
+      return;
+    }
     if (!(await asyncConfirm(`确认删除该记录？\nkey: ${key}\n此操作不可恢复。`))) return;
     try {
       const data = await apiPost("/api/delete_record", { keys: [key] });
@@ -389,7 +460,7 @@
     }
   }
 
-  // ---- 审计日志 ----
+  // ---- 审计日志（仅 admin） ----
   async function loadAudit() {
     const tbody = document.getElementById("auditTbody");
     const empty = document.getElementById("auditEmpty");
@@ -418,7 +489,7 @@
     }
   }
 
-  // ---- 请求日志 ----
+  // ---- 请求日志（仅 admin） ----
   async function loadRequests() {
     const tbody = document.getElementById("requestTbody");
     const empty = document.getElementById("requestEmpty");
@@ -452,16 +523,25 @@
     if (token) {
       // 校验已存的 token
       try {
+        const header = isAdmin() ? "X-Admin-Token" : "X-Client-Token";
         const resp = await fetch("/api/auth_check", {
-          headers: { "X-Admin-Token": token },
+          headers: { [header]: token },
         });
         if (resp.ok) {
+          const data = await resp.json();
+          // 用服务端返回的 token_type 覆盖存储（防止 token 类型变化）
+          if (data.token_type) {
+            tokenType = data.token_type;
+            localStorage.setItem(TOKEN_TYPE_KEY, tokenType);
+          }
           showDashboard();
           return;
         }
       } catch {}
       token = "";
+      tokenType = "";
       localStorage.removeItem(TOKEN_KEY);
+      localStorage.removeItem(TOKEN_TYPE_KEY);
     }
     showLogin();
   }
