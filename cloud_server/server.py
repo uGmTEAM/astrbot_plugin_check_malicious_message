@@ -31,12 +31,13 @@ from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
-__VERSION__ = "1.1.0"
+__VERSION__ = "1.2.0"
 CONFIG_PATH_DEFAULT = "config.json"
 RECORDS_FILE = "records.json"
 SPECIAL_FILE = "special_records.json"
 AUDIT_LOG = "audit.log.jsonl"
 REQUEST_LOG = "request.log.jsonl"
+WEB_DIR = "web"
 
 # ---------------------------------------------------------------------------
 # 全局状态（受 LOCK 保护）
@@ -132,6 +133,44 @@ def next_seq() -> int:
     global META
     META["last_seq"] = int(META.get("last_seq", 0)) + 1
     return META["last_seq"]
+
+
+def read_jsonl(path: str, limit: int = 500) -> list:
+    """读取 JSONL 日志文件的最近 limit 条记录。"""
+    try:
+        if not os.path.exists(path):
+            return []
+        with open(path, "r", encoding="utf-8") as f:
+            lines = f.readlines()
+        result = []
+        for line in reversed(lines[-limit * 2:]):  # 多读一些以应对过滤
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                result.append(json.loads(line))
+            except Exception:
+                continue
+            if len(result) >= limit:
+                break
+        return result
+    except Exception:
+        return []
+
+
+# Web 管理器静态文件目录（脚本所在目录下的 web/）
+WEB_BASE = os.path.join(os.path.dirname(os.path.abspath(__file__)), WEB_DIR)
+
+# 静态文件 MIME 类型映射
+MIME_TYPES = {
+    ".html": "text/html; charset=utf-8",
+    ".js": "application/javascript; charset=utf-8",
+    ".css": "text/css; charset=utf-8",
+    ".json": "application/json; charset=utf-8",
+    ".png": "image/png",
+    ".svg": "image/svg+xml",
+    ".ico": "image/x-icon",
+}
 
 
 # ---------------------------------------------------------------------------
@@ -402,7 +441,7 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Access-Control-Allow-Origin", ",".join(CONFIG.get("cors_origins", ["*"])))
         self.send_header("Access-Control-Allow-Methods", "GET,POST,DELETE,OPTIONS")
-        self.send_header("Access-Control-Allow-Headers", "Content-Type,X-Client-Token,X-Admin-Token")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type,X-Client-Token,X-Admin-Token,Authorization")
         if extra_headers:
             for k, v in extra_headers.items():
                 self.send_header(k, v)
@@ -436,8 +475,54 @@ class Handler(BaseHTTPRequestHandler):
         return bool(tok) and tok == CONFIG.get("client_token")
 
     def _check_admin_token(self) -> bool:
+        # 支持 X-Admin-Token 头 或 Authorization: Bearer <token>
         tok = self.headers.get("X-Admin-Token", "")
+        if not tok:
+            auth = self.headers.get("Authorization", "")
+            if auth.startswith("Bearer "):
+                tok = auth[7:]
         return bool(tok) and tok == CONFIG.get("admin_token")
+
+    def _check_any_token(self) -> bool:
+        """读端点：接受 client_token 或 admin_token。"""
+        return self._check_client_token() or self._check_admin_token()
+
+    # ---- 静态文件服务（Web 管理器） ----
+    def _serve_static(self, rel_path: str) -> bool:
+        """从 web/ 目录提供静态文件。返回 True 表示已处理。"""
+        if not rel_path or rel_path == "/":
+            rel_path = "/index.html"
+        # 防止路径穿越
+        safe = rel_path.lstrip("/")
+        full = os.path.normpath(os.path.join(WEB_BASE, safe))
+        if not full.startswith(WEB_BASE):
+            self._send_simple(403, "forbidden")
+            return True
+        if not os.path.isfile(full):
+            return False
+        ext = os.path.splitext(full)[1].lower()
+        ctype = MIME_TYPES.get(ext, "application/octet-stream")
+        try:
+            with open(full, "rb") as f:
+                body = f.read()
+        except Exception as e:
+            self._send_simple(500, f"read error: {e}")
+            return True
+        self.send_response(200)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-cache")
+        self.end_headers()
+        self.wfile.write(body)
+        return True
+
+    def _send_simple(self, status: int, text: str) -> None:
+        body = text.encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
 
     # ---- 路由分发 ----
     def do_OPTIONS(self):  # noqa: N802
@@ -449,28 +534,57 @@ class Handler(BaseHTTPRequestHandler):
             path = parsed.path.rstrip("/") or "/"
             qs = parse_qs(parsed.query)
 
+            # ---- Web 管理器静态文件（无 Token 即可访问，前端自行登录） ----
+            if path == "/" or path.startswith("/static/"):
+                rel = path.replace("/static/", "/", 1) if path.startswith("/static/") else path
+                if self._serve_static(rel):
+                    return
+                # 静态文件不存在 → 回退到 index.html（SPA）
+                if self._serve_static("/index.html"):
+                    return
+                return self._send_simple(404, "web manager not found")
+            if path in ("/app.js", "/style.css", "/favicon.ico"):
+                if self._serve_static(path):
+                    return
+                return self._send_simple(404, "not found")
+
             if path == "/api/health":
                 return self._handle_health()
+            if path == "/api/auth_check":
+                # 供前端校验 token 是否有效
+                if not self._check_admin_token():
+                    return self._send_error_json(HTTPStatus.UNAUTHORIZED, "invalid admin token")
+                return self._send_json(HTTPStatus.OK, {"ok": True, "role": "admin"})
             if path == "/api/stats":
-                if not self._check_client_token():
+                if not self._check_any_token():
                     log_request("GET", path, 401, self.client_address[0])
-                    return self._send_error_json(HTTPStatus.UNAUTHORIZED, "invalid client token")
+                    return self._send_error_json(HTTPStatus.UNAUTHORIZED, "invalid token")
                 return self._handle_stats()
             if path == "/api/records":
-                if not self._check_client_token():
+                if not self._check_any_token():
                     log_request("GET", path, 401, self.client_address[0])
-                    return self._send_error_json(HTTPStatus.UNAUTHORIZED, "invalid client token")
+                    return self._send_error_json(HTTPStatus.UNAUTHORIZED, "invalid token")
                 return self._handle_list_records(qs)
             if path == "/api/special":
-                if not self._check_client_token():
+                if not self._check_any_token():
                     log_request("GET", path, 401, self.client_address[0])
-                    return self._send_error_json(HTTPStatus.UNAUTHORIZED, "invalid client token")
+                    return self._send_error_json(HTTPStatus.UNAUTHORIZED, "invalid token")
                 return self._handle_list_special(qs)
             if path == "/api/sync":
                 if not self._check_client_token():
                     log_request("GET", path, 401, self.client_address[0])
                     return self._send_error_json(HTTPStatus.UNAUTHORIZED, "invalid client token")
                 return self._handle_get_sync(qs)
+            if path == "/api/audit_log":
+                if not self._check_admin_token():
+                    log_request("GET", path, 401, self.client_address[0])
+                    return self._send_error_json(HTTPStatus.UNAUTHORIZED, "invalid admin token")
+                return self._handle_audit_log(qs)
+            if path == "/api/request_log":
+                if not self._check_admin_token():
+                    log_request("GET", path, 401, self.client_address[0])
+                    return self._send_error_json(HTTPStatus.UNAUTHORIZED, "invalid admin token")
+                return self._handle_request_log(qs)
             log_request("GET", path, 404, self.client_address[0])
             return self._send_error_json(HTTPStatus.NOT_FOUND, "not found")
         except Exception as e:
@@ -482,6 +596,9 @@ class Handler(BaseHTTPRequestHandler):
             parsed = urlparse(self.path)
             path = parsed.path.rstrip("/") or "/"
 
+            if path == "/api/auth":
+                # Web 管理器登录：校验 admin_token
+                return self._handle_auth()
             if path == "/api/upload_record":
                 if not self._check_client_token():
                     log_request("POST", path, 401, self.client_address[0])
@@ -502,6 +619,12 @@ class Handler(BaseHTTPRequestHandler):
                     log_request("POST", path, 401, self.client_address[0])
                     return self._send_error_json(HTTPStatus.UNAUTHORIZED, "invalid admin token")
                 return self._handle_delete_record()
+            if path == "/api/revoke_record":
+                # 误判撤回：client_token 鉴权 + bot_id 一致性校验
+                if not self._check_client_token():
+                    log_request("POST", path, 401, self.client_address[0])
+                    return self._send_error_json(HTTPStatus.UNAUTHORIZED, "invalid client token")
+                return self._handle_revoke_record()
             log_request("POST", path, 404, self.client_address[0])
             return self._send_error_json(HTTPStatus.NOT_FOUND, "not found")
         except Exception as e:
@@ -727,6 +850,116 @@ class Handler(BaseHTTPRequestHandler):
             "not_found": not_found,
             "deleted_count": len(deleted),
         })
+
+    def _handle_auth(self):
+        """Web 管理器登录：校验 admin_token。"""
+        body, err = self._read_body()
+        if err:
+            return self._send_error_json(HTTPStatus.BAD_REQUEST, f"invalid body: {err}")
+        token = str(body.get("token", "") or "")
+        if not token:
+            return self._send_error_json(HTTPStatus.BAD_REQUEST, "missing token")
+        if token == CONFIG.get("admin_token"):
+            log_request("POST", "/api/auth", 200, self.client_address[0], "login_ok")
+            audit_log("login", "web", {"client": self.client_address[0]})
+            return self._send_json(HTTPStatus.OK, {"ok": True, "role": "admin"})
+        log_request("POST", "/api/auth", 401, self.client_address[0], "login_fail")
+        return self._send_error_json(HTTPStatus.UNAUTHORIZED, "invalid admin token")
+
+    def _handle_revoke_record(self):
+        """误判撤回：校验 bot_id 在记录 sources 中，递减 count。
+
+        body: {bot_id, record_key, log_id, message, reason}
+        """
+        body, err = self._read_body()
+        if err:
+            log_request("POST", "/api/revoke_record", 400, self.client_address[0], err)
+            return self._send_error_json(HTTPStatus.BAD_REQUEST, f"invalid body: {err}")
+        bot_id = str(body.get("bot_id", "")) or ""
+        record_key = str(body.get("record_key", "")) or ""
+        log_id = str(body.get("log_id", "")) or ""
+        message = str(body.get("message", "")) or ""
+        reason = str(body.get("reason", "")) or ""
+        if not record_key or not bot_id:
+            return self._send_error_json(HTTPStatus.BAD_REQUEST, "missing bot_id/record_key")
+
+        with LOCK:
+            rec = RECORDS.get(record_key)
+            if rec is None:
+                log_request("POST", "/api/revoke_record", 404, self.client_address[0],
+                            f"key={record_key}")
+                return self._send_error_json(HTTPStatus.NOT_FOUND, "record not found")
+            # 校验：bot_id 必须在该记录的 sources 中（即上传该警告的 bot 才能撤回）
+            sources = rec.get("sources") or []
+            if bot_id not in sources:
+                log_request("POST", "/api/revoke_record", 403, self.client_address[0],
+                            f"bot_id={bot_id} not in sources")
+                audit_log("revoke_denied", bot_id, {
+                    "record_key": record_key,
+                    "reason": "bot_id not in sources",
+                    "sources": sources,
+                })
+                return self._send_error_json(
+                    HTTPStatus.FORBIDDEN,
+                    f"bot_id '{bot_id}' not in record sources {sources}",
+                )
+            old_count = int(rec.get("count", 0) or 0)
+            new_count = max(0, old_count - 1)
+            rec["count"] = new_count
+            rec["updated_by"] = bot_id
+            rec["updated_at"] = now_ts()
+            rec["seq"] = next_seq()
+            # 记录撤回标记
+            revokes = rec.setdefault("revokes", [])
+            revokes.append({
+                "bot_id": bot_id,
+                "log_id": log_id,
+                "message": message[:500],
+                "reason": reason,
+                "time": now_ts(),
+                "old_count": old_count,
+                "new_count": new_count,
+            })
+            save_records()
+
+        audit_log("revoke_record", bot_id, {
+            "record_key": record_key,
+            "log_id": log_id,
+            "old_count": old_count,
+            "new_count": new_count,
+            "reason": reason,
+        })
+        log_request("POST", "/api/revoke_record", 200, self.client_address[0],
+                    f"key={record_key} {old_count}->{new_count}")
+        return self._send_json(HTTPStatus.OK, {
+            "ok": True,
+            "revoked": True,
+            "record_key": record_key,
+            "old_count": old_count,
+            "new_count": new_count,
+        })
+
+    def _handle_audit_log(self, qs):
+        try:
+            limit = int(qs.get("limit", ["500"])[0])
+        except ValueError:
+            limit = 500
+        limit = max(1, min(limit, 5000))
+        path = os.path.join(LOG_DIR, AUDIT_LOG)
+        items = read_jsonl(path, limit)
+        log_request("GET", "/api/audit_log", 200, self.client_address[0])
+        return self._send_json(HTTPStatus.OK, {"total": len(items), "items": items})
+
+    def _handle_request_log(self, qs):
+        try:
+            limit = int(qs.get("limit", ["500"])[0])
+        except ValueError:
+            limit = 500
+        limit = max(1, min(limit, 5000))
+        path = os.path.join(LOG_DIR, REQUEST_LOG)
+        items = read_jsonl(path, limit)
+        log_request("GET", "/api/request_log", 200, self.client_address[0])
+        return self._send_json(HTTPStatus.OK, {"total": len(items), "items": items})
 
 
 def _evict_old_records(max_size: int) -> None:
