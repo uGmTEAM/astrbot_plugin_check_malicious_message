@@ -20,7 +20,13 @@ const paneStats = document.getElementById("pane-stats");
 const paneLogs = document.getElementById("pane-logs");
 const paneSpecial = document.getElementById("pane-special");
 const paneTimeout = document.getElementById("pane-timeout");
+const paneAppeals = document.getElementById("pane-appeals");
 const paneCloud = document.getElementById("pane-cloud");
+const appealTbody = document.getElementById("appealTbody");
+const appealEmptyEl = document.getElementById("appealEmpty");
+const appealSummaryEl = document.getElementById("appealsSummary");
+const appealStatusFilter = document.getElementById("appealStatusFilter");
+const appealRefreshBtn = document.getElementById("appealRefreshBtn");
 
 let timer = null;
 let activeTab = "stats";
@@ -246,6 +252,148 @@ async function loadLogs() {
   }
 }
 
+// ---------------------------------------------------------------------------
+// 申诉审核
+// ---------------------------------------------------------------------------
+
+function appealStatusBadge(status) {
+  switch (status) {
+    case "pending_review":
+      return '<span class="badge low">待审核</span>';
+    case "auto_revoked":
+      return '<span class="badge auto-revoked">已自动撤回</span>';
+    case "approved":
+      return '<span class="badge approved">已通过</span>';
+    case "rejected":
+      return '<span class="badge zero">已拒绝</span>';
+    case "pending":
+      return '<span class="badge low">处理中</span>';
+    default:
+      return `<span class="badge zero">${escapeHtml(status || "-")}</span>`;
+  }
+}
+
+function fmtAppealTime(ts) {
+  if (!ts) return "-";
+  try {
+    return new Date(ts * 1000).toLocaleString();
+  } catch (e) {
+    return "-";
+  }
+}
+
+async function loadAppeals() {
+  try {
+    const params = { limit: 500 };
+    const statusFilter = appealStatusFilter ? appealStatusFilter.value : "";
+    if (statusFilter) params.status = statusFilter;
+    const res = await bridge.apiGet("appeals", params);
+    const data = res && res.data !== undefined ? res.data : res;
+    const items = data.items || [];
+    const total = data.total || 0;
+
+    const pendingCount = items.filter((a) => a.status === "pending_review").length;
+    appealSummaryEl.innerHTML =
+      `共 <b>${total}</b> 条申诉 · 当前筛选 <b>${items.length}</b> 条` +
+      (pendingCount ? ` · <span class="badge low">${pendingCount} 待审核</span>` : "");
+
+    if (items.length === 0) {
+      appealTbody.innerHTML = "";
+      appealEmptyEl.hidden = false;
+      appealEmptyEl.textContent = "暂无申诉记录。";
+      return;
+    }
+    appealEmptyEl.hidden = true;
+
+    appealTbody.innerHTML = items
+      .map((a, i) => {
+        const appealId = escapeHtml(a.appeal_id || "");
+        const status = a.status || "";
+        const isPendingReview = status === "pending_review";
+        const reviewDecision = escapeHtml(a.review_decision || "-");
+        const reviewReason = escapeHtml(a.review_reason || "-");
+        const actions = isPendingReview
+          ? `<button class="btn small" data-appeal-id="${appealId}" data-action="approve">✅ 通过</button> ` +
+            `<button class="btn small danger" data-appeal-id="${appealId}" data-action="reject">❌ 拒绝</button>`
+          : `<button class="btn small" disabled>已处理</button>`;
+        return `<tr>
+          <td>${i + 1}</td>
+          <td><code class="appeal-id">${appealId}</code></td>
+          <td>
+            <div class="user">${escapeHtml(a.sender_name || a.user_id || "未知")}</div>
+            <div class="uid">UID: ${escapeHtml(a.user_id || "-")}</div>
+          </td>
+          <td class="msg" title="${escapeHtml(a.message)}">${escapeHtml(a.message || "-")}</td>
+          <td class="reason">
+            <div>决定：${reviewDecision}</div>
+            <div class="uid">理由：${reviewReason}</div>
+          </td>
+          <td>${appealStatusBadge(status)}</td>
+          <td>${escapeHtml(fmtAppealTime(a.created_at))}</td>
+          <td>${actions}</td>
+        </tr>`;
+      })
+      .join("");
+
+    appealTbody.querySelectorAll('button[data-action="approve"]').forEach((btn) => {
+      btn.addEventListener("click", () => approveAppeal(btn.dataset.appealId, btn));
+    });
+    appealTbody.querySelectorAll('button[data-action="reject"]').forEach((btn) => {
+      btn.addEventListener("click", () => rejectAppeal(btn.dataset.appealId, btn));
+    });
+  } catch (e) {
+    if (activeTab === "appeals") {
+      appealSummaryEl.textContent = "加载失败：" + (e && e.message ? e.message : e);
+      appealEmptyEl.hidden = false;
+      appealEmptyEl.textContent = "加载失败：" + (e && e.message ? e.message : e);
+    }
+  }
+}
+
+async function approveAppeal(appealId, btn) {
+  if (!appealId) {
+    toast("该申诉缺少 appeal_id，无法通过", "error");
+    return;
+  }
+  if (btn) btn.disabled = true;
+  try {
+    const res = await bridge.apiPost("appeal/approve", { appeal_id: appealId });
+    const data = res && res.data !== undefined ? res.data : res;
+    if (data && data.ok) {
+      toast(`✅ 已通过申诉：count ${data.old_count || 0} → ${data.new_count || 0}`, "ok");
+      await loadAppeals();
+    } else {
+      toast("通过失败：" + (data && data.error ? data.error : "未知错误"), "error");
+    }
+  } catch (e) {
+    toast("通过失败：" + (e && e.message ? e.message : e), "error");
+  } finally {
+    if (btn) btn.disabled = false;
+  }
+}
+
+async function rejectAppeal(appealId, btn) {
+  if (!appealId) {
+    toast("该申诉缺少 appeal_id，无法拒绝", "error");
+    return;
+  }
+  if (btn) btn.disabled = true;
+  try {
+    const res = await bridge.apiPost("appeal/reject", { appeal_id: appealId });
+    const data = res && res.data !== undefined ? res.data : res;
+    if (data && data.ok) {
+      toast(`✅ 已拒绝申诉`, "ok");
+      await loadAppeals();
+    } else {
+      toast("拒绝失败：" + (data && data.error ? data.error : "未知错误"), "error");
+    }
+  } catch (e) {
+    toast("拒绝失败：" + (e && e.message ? e.message : e), "error");
+  } finally {
+    if (btn) btn.disabled = false;
+  }
+}
+
 async function loadSpecial() {
   try {
     const res = await bridge.apiGet("special", { limit: 500 });
@@ -389,6 +537,8 @@ async function load() {
     await loadSpecial();
   } else if (activeTab === "timeout") {
     await loadTimeout();
+  } else if (activeTab === "appeals") {
+    await loadAppeals();
   } else if (activeTab === "cloud") {
     await loadCloud();
   }
@@ -567,6 +717,7 @@ const paneMap = {
   logs: paneLogs,
   special: paneSpecial,
   timeout: paneTimeout,
+  appeals: paneAppeals,
   cloud: paneCloud,
 };
 
@@ -791,9 +942,17 @@ const cloudDedupBtn = document.getElementById("cloudDedupBtn");
 const cloudRefreshBtn = document.getElementById("cloudRefreshBtn");
 if (cloudSyncBtn) cloudSyncBtn.addEventListener("click", cloudSyncNow);
 if (cloudUploadBtn) cloudUploadBtn.addEventListener("click", cloudUploadRecords);
-if (cloudUploadSpecialBtn) cloudUploadSpecialBtn.addEventListener("click", cloudUploadSpecial);
+if (cloudUploadSpecialBtn) cloudUploadBtn.addEventListener("click", cloudUploadSpecial);
 if (cloudDedupBtn) cloudDedupBtn.addEventListener("click", cloudDedup);
 if (cloudRefreshBtn) cloudRefreshBtn.addEventListener("click", loadCloud);
+
+// 申诉审核按钮事件
+if (appealStatusFilter) {
+  appealStatusFilter.addEventListener("change", loadAppeals);
+}
+if (appealRefreshBtn) {
+  appealRefreshBtn.addEventListener("click", loadAppeals);
+}
 
 (async () => {
   await bridge.ready();

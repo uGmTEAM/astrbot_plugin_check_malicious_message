@@ -26,6 +26,7 @@
       <button class="tab" data-tab="logs">被警告消息备案</button>
       <button class="tab" data-tab="special">特殊记录</button>
       <button class="tab" data-tab="timeout">超时记录</button>
+      <button class="tab" data-tab="appeals">📨 申诉审核</button>
       <button class="tab" data-tab="cloud">☁️ 云同步</button>
     </nav>
 
@@ -120,6 +121,42 @@
         </table>
       </div>
       <p class="empty" id="timeoutEmpty" hidden>暂无超时记录。</p>
+    </section>
+
+    <!-- Tab: 申诉审核 -->
+    <section id="pane-appeals" class="pane" hidden>
+      <div class="summary" id="appealsSummary">加载中…</div>
+      <div class="appeals-toolbar">
+        <label class="auto">
+          状态筛选：
+          <select id="appealStatusFilter">
+            <option value="">全部</option>
+            <option value="pending_review" selected>待审核</option>
+            <option value="approved">已通过</option>
+            <option value="rejected">已拒绝</option>
+            <option value="auto_revoked">已自动撤回</option>
+          </select>
+        </label>
+        <button id="appealRefreshBtn" class="btn small">🔄 刷新</button>
+      </div>
+      <div class="table-wrap">
+        <table id="appealTable">
+          <thead>
+            <tr>
+              <th>#</th>
+              <th>申诉编号</th>
+              <th>用户</th>
+              <th>申诉消息</th>
+              <th>LLM复核</th>
+              <th>状态</th>
+              <th>创建时间</th>
+              <th>操作</th>
+            </tr>
+          </thead>
+          <tbody id="appealTbody"></tbody>
+        </table>
+      </div>
+      <p class="empty" id="appealEmpty" hidden>暂无申诉记录。</p>
     </section>
 
     <!-- Tab: 云同步 -->

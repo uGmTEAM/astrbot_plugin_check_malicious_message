@@ -244,6 +244,27 @@ td.msg {
   font-size: 11px;
 }
 
+/* 申诉状态徽章 */
+.badge.approved {
+  background: #e0e7ff;
+  color: var(--primary);
+}
+
+.badge.auto-revoked {
+  background: #e6f9ec;
+  color: #1f8a4c;
+}
+
+/* 申诉编号（等宽小标签） */
+.appeal-id {
+  background: #eef0f3;
+  color: var(--text);
+  padding: 1px 6px;
+  border-radius: 4px;
+  font-family: "SFMono-Regular", Consolas, monospace;
+  font-size: 12px;
+}
+
 /* 已撤回记录行：灰显 */
 tr.revoked-row td {
   opacity: 0.55;
@@ -311,6 +332,30 @@ tr:hover td {
 
 .cloud-actions .btn:hover {
   background: #eef1ff;
+}
+
+/* 申诉审核工具栏 */
+.appeals-toolbar {
+  display: flex;
+  gap: 12px;
+  margin-bottom: 16px;
+  align-items: center;
+  flex-wrap: wrap;
+}
+
+.appeals-toolbar select {
+  padding: 4px 8px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  font-size: 13px;
+  background: var(--card);
+  color: var(--text);
+  cursor: pointer;
+}
+
+.appeals-toolbar select:focus {
+  outline: none;
+  border-color: var(--primary);
 }
 
 .summary code {
