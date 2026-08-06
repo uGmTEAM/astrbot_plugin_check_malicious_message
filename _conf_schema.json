@@ -262,5 +262,35 @@
     "type": "bool",
     "default": true,
     "hint": "开启后，被标记为误判的消息（精确+归一化匹配）在检测前会被跳过，避免再次误判。误判记录在插件页「被警告消息备案」中通过撤回按钮产生。"
+  },
+  "enable_appeal": {
+    "description": "启用私聊申诉功能",
+    "type": "bool",
+    "default": true,
+    "hint": "开启后，用户私聊机器人时由 LLM 识别意图（查询记录/申请撤回/闲聊），可自然语言申请撤回警告。理由充分的自动撤回，难以评判的转发管理员审核。"
+  },
+  "appeal_admin_groups": {
+    "description": "申诉审核通知管理群列表",
+    "type": "list",
+    "default": [],
+    "hint": "难以评判的申诉会转发到这些群，管理员可在群内用「/申诉通过 <id>」或「/申诉拒绝 <id>」评判。留空则不通知管理群。"
+  },
+  "appeal_admin_users": {
+    "description": "申诉审核通知管理员QQ列表",
+    "type": "list",
+    "default": [],
+    "hint": "难以评判的申诉会私聊通知这些管理员。留空则不私聊通知。"
+  },
+  "appeal_auto_revoke": {
+    "description": "LLM判定理由充分时自动撤回",
+    "type": "bool",
+    "default": true,
+    "hint": "开启后，LLM 复核认为理由充分时直接撤回警告并解禁；关闭后所有申诉都转管理员审核。"
+  },
+  "appeal_pending_timeout_hours": {
+    "description": "待审核申诉超时时间（小时）",
+    "type": "int",
+    "default": 72,
+    "hint": "超过此时间未处理的申诉自动标记为过期，不再等待管理员评判。设为 0 则永不超时。"
   }
 }

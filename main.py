@@ -4,7 +4,7 @@ astrbot_plugin_check_malicious_message
 检测到时自动发出警告（以 LLM 当前人格的语气生成），并记录每人的被警告次数 x：
   - 当 x 超过阈值（默认 5）且机器人为群管理员时，自动禁言 10*x 分钟；
   - 私聊或机器人非管理员的群仅累计 x，不尝试禁言；
-  - 每 2 小时所有人的 x 自动 -1；
+  - 每 12 小时所有人的 x 自动 -1；
   - 通过插件页面实时展示每个人的 x 次数。
 
 v1.0.1 新增功能：
@@ -62,7 +62,7 @@ DEFAULT_WARN_MESSAGE = (
     "多次违规可能被禁言或移出。当前累计警告次数：{x}。"
 )
 
-DECAY_INTERVAL = 2 * 3600  # 每 2 小时衰减一次
+DECAY_INTERVAL = 12 * 3600  # 每 12 小时衰减一次
 ROLE_CACHE_TTL = 600  # 机器人群角色缓存 10 分钟
 TARGET_ROLE_CACHE_TTL = 300  # 目标用户群角色缓存 5 分钟
 SPAM_TRACKER_MAX = 20  # 每用户每群保留的最近消息条数
@@ -96,6 +96,8 @@ class CheckMaliciousMessagePlugin(Star):
         self._daily_summaries: list[dict] = []
         # 误判撤回记录：被标记为误判的消息，检测前跳过以免再次误判
         self._false_positives: list[dict] = []
+        # 申诉记录：用户私聊申请撤回警告，LLM 复核 + 管理员审核
+        self._appeals: list[dict] = []
         self._meta: dict = {
             "last_decrement": time.time(),
             "last_archive_check": 0.0,
@@ -268,6 +270,25 @@ class CheckMaliciousMessagePlugin(Star):
             self._api_cloud_blacklist_remove,
             ["POST"],
             "从云端黑名单移除 IP（需 admin_token）",
+        )
+        # 申诉审核 API
+        self.context.register_web_api(
+            f"/{PLUGIN_NAME}/appeals",
+            self._api_appeals,
+            ["GET"],
+            "获取申诉列表",
+        )
+        self.context.register_web_api(
+            f"/{PLUGIN_NAME}/appeal/approve",
+            self._api_appeal_approve,
+            ["POST"],
+            "通过申诉",
+        )
+        self.context.register_web_api(
+            f"/{PLUGIN_NAME}/appeal/reject",
+            self._api_appeal_reject,
+            ["POST"],
+            "拒绝申诉",
         )
 
     # ------------------------------------------------------------------ 生命周期
@@ -446,6 +467,12 @@ class CheckMaliciousMessagePlugin(Star):
             return None
         if not is_private and not cfg.get("scan_group", True):
             return None
+
+        # ★ 私聊申诉入口：LLM 意图识别（查询记录/申请撤回/闲聊）
+        if is_private and bool(cfg.get("enable_appeal", True)):
+            appeal_result = await self._handle_appeal_chat(event, message_str, sender_id, platform_id)
+            if appeal_result is not None:
+                return appeal_result  # 已处理（查询/申诉），不再做恶意检测
 
         try:
             min_len = int(cfg.get("min_length", 2) or 0)
@@ -1561,7 +1588,7 @@ class CheckMaliciousMessagePlugin(Star):
         # （否则重载后会用旧时间戳，导致「只衰减一次」/倒计时错乱）
         self._save()
         logger.info(
-            f"[恶意消息检测] 每 2 小时衰减完成: changed={changed}, decayed={len(decayed_keys)}, "
+            f"[恶意消息检测] 每 12 小时衰减完成: changed={changed}, decayed={len(decayed_keys)}, "
             f"last_decrement={self._fmt_ts(self._meta['last_decrement'])}"
         )
         # ★ 合法衰减同步：通知服务端按 bot_id 统一衰减（不传具体 keys）
@@ -1698,6 +1725,7 @@ class CheckMaliciousMessagePlugin(Star):
                 self._timeout_archive = data.get("timeout_archive", []) or []
                 self._daily_summaries = data.get("daily_summaries", []) or []
                 self._false_positives = data.get("false_positives", []) or []
+                self._appeals = data.get("appeals", []) or []
                 self._meta = data.get("meta", {}) or {}
                 # 为旧日志条目补填 log_id（升级兼容）
                 for log_entry in self._logs:
@@ -1723,6 +1751,7 @@ class CheckMaliciousMessagePlugin(Star):
             self._timeout_archive = []
             self._daily_summaries = []
             self._false_positives = []
+            self._appeals = []
             self._meta = {"last_decrement": time.time(), "last_archive_check": 0.0, "last_daily_summary": 0.0}
 
     def _save(self):
@@ -1734,6 +1763,7 @@ class CheckMaliciousMessagePlugin(Star):
                 "timeout_archive": self._timeout_archive,
                 "daily_summaries": self._daily_summaries,
                 "false_positives": self._false_positives,
+                "appeals": self._appeals,
                 "meta": self._meta,
                 "cloud": self._cloud,
             }
@@ -2736,6 +2766,659 @@ class CheckMaliciousMessagePlugin(Star):
             "items": items,
         })
 
+    # ------------------------------------------------------------------ 申诉 Web API
+
+    async def _api_appeals(self):
+        """返回申诉列表，支持 status 过滤。"""
+        status = request.query.get("status", "", type=str) or ""
+        items = list(reversed(self._appeals))
+        if status:
+            items = [a for a in items if a.get("status") == status]
+        limit = request.query.get("limit", 500, type=int) or 500
+        items = items[:limit]
+        return json_response({
+            "total": len(self._appeals),
+            "items": items,
+        })
+
+    async def _api_appeal_approve(self):
+        """通过申诉。body: {"appeal_id": "..."}"""
+        body = {}
+        try:
+            body = await request.json(default={}) or {}
+        except Exception:
+            body = {}
+        if not isinstance(body, dict):
+            body = {}
+        appeal_id = str(body.get("appeal_id", "") or "").strip()
+        if not appeal_id:
+            return error_response("缺少 appeal_id", status_code=400)
+        appeal = None
+        for a in self._appeals:
+            if a.get("appeal_id") == appeal_id:
+                appeal = a
+                break
+        if appeal is None:
+            return error_response("未找到该申诉", status_code=404)
+        if appeal.get("status") not in ("pending", "pending_review"):
+            return error_response(f"申诉已处理（状态：{appeal.get('status')}）", status_code=409)
+
+        log_id = appeal.get("target_log_id", "")
+        uid = appeal.get("user_id", "")
+        pid = appeal.get("platform_id", "")
+        reason = f"管理员通过申诉（Web）：{appeal.get('review_reason', '')}"
+
+        # 执行撤回（不含解禁，Web API 无 event 上下文）
+        target_log = None
+        for log_entry in self._logs:
+            if log_entry.get("log_id") == log_id:
+                target_log = log_entry
+                break
+        old_count = 0
+        new_count = 0
+        if target_log and not target_log.get("revoked"):
+            message = str(target_log.get("message", ""))
+            if uid:
+                key = self._record_key(pid, uid)
+                rec = self._records.get(key)
+                if rec:
+                    old_count = int(rec.get("count", 0) or 0)
+                    new_count = max(0, old_count - 1)
+                    rec["count"] = new_count
+                    self._cloud_schedule_push(key)
+            target_log["revoked"] = True
+            target_log["revoke_reason"] = reason
+            target_log["revoked_at"] = time.time()
+            if message and not self._is_false_positive(message):
+                self._false_positives.append({
+                    "message": message, "reason": reason,
+                    "original_reason": target_log.get("reason", ""),
+                    "user_id": uid, "platform_id": pid, "log_id": log_id,
+                    "revoked_at": target_log["revoked_at"],
+                })
+                if len(self._false_positives) > 2000:
+                    self._false_positives = self._false_positives[-2000:]
+            if self._cloud_enabled() and bool(self.config.get("enable_cloud_revoke", True)) and uid:
+                key = self._record_key(pid, uid)
+                await self._cloud_revoke_record(key, log_id, message, reason)
+
+        appeal["status"] = "approved"
+        appeal["resolved_at"] = time.time()
+        appeal["resolved_by"] = "web_admin"
+        self._save()
+        return json_response({
+            "ok": True, "appeal_id": appeal_id,
+            "old_count": old_count, "new_count": new_count,
+        })
+
+    async def _api_appeal_reject(self):
+        """拒绝申诉。body: {"appeal_id": "..."}"""
+        body = {}
+        try:
+            body = await request.json(default={}) or {}
+        except Exception:
+            body = {}
+        if not isinstance(body, dict):
+            body = {}
+        appeal_id = str(body.get("appeal_id", "") or "").strip()
+        if not appeal_id:
+            return error_response("缺少 appeal_id", status_code=400)
+        appeal = None
+        for a in self._appeals:
+            if a.get("appeal_id") == appeal_id:
+                appeal = a
+                break
+        if appeal is None:
+            return error_response("未找到该申诉", status_code=404)
+        if appeal.get("status") not in ("pending", "pending_review"):
+            return error_response(f"申诉已处理（状态：{appeal.get('status')}）", status_code=409)
+        appeal["status"] = "rejected"
+        appeal["resolved_at"] = time.time()
+        appeal["resolved_by"] = "web_admin"
+        appeal["resolve_note"] = "管理员拒绝（Web）"
+        self._save()
+        return json_response({"ok": True, "appeal_id": appeal_id})
+
+    # ------------------------------------------------------------------ 申诉功能
+
+    async def _handle_appeal_chat(
+        self, event: AstrMessageEvent, message_str: str, sender_id: str, platform_id: str
+    ) -> Optional[MessageEventResult]:
+        """私聊申诉入口：LLM 意图识别（查询记录/申请撤回/闲聊）。
+
+        返回 MessageEventResult 表示已处理；返回 None 表示闲聊，继续恶意检测。
+        """
+        cfg = self.config
+        umo = event.unified_msg_origin
+        try:
+            provider_id = await self.context.get_current_chat_provider_id(umo=umo)
+        except Exception:
+            provider_id = ""
+        if not provider_id:
+            provider_id = cfg.get("provider_id", "") or ""
+
+        # 意图识别 prompt
+        intent_prompt = (
+            "你是一个意图识别助手。请判断用户消息的意图，只返回一个 JSON：\n"
+            '{"intent": "query" | "appeal" | "chat"}\n'
+            "规则：\n"
+            '- query：用户想查询自己的警告/禁言记录（如"我被警告了吗""我有几次警告"）\n'
+            '- appeal：用户想申请撤回/申诉某条警告（如"我想申诉""那条不算恶意""帮我撤回"）\n'
+            '- chat：普通闲聊，不属于以上两类\n'
+            f"用户消息：{message_str[:500]}"
+        )
+        try:
+            resp = await self.context.llm_generate(
+                chat_provider_id=provider_id, prompt=intent_prompt, system_prompt="你是意图识别助手，只输出JSON。"
+            )
+            raw = getattr(resp, "completion_text", "") or ""
+            intent = self._parse_appeal_intent(raw)
+        except Exception as e:
+            logger.warning(f"[恶意消息检测] 申诉意图识别失败，放行到恶意检测: {e}")
+            return None
+
+        if intent == "query":
+            return await self._appeal_query_records(event, sender_id, platform_id)
+        if intent == "appeal":
+            return await self._appeal_review_and_revoke(event, message_str, sender_id, platform_id, provider_id)
+        # chat → 返回 None，继续恶意检测
+        return None
+
+    @staticmethod
+    def _parse_appeal_intent(raw: str) -> str:
+        """从 LLM 输出中解析意图。"""
+        raw = (raw or "").strip()
+        # 尝试提取 JSON
+        import re as _re
+        m = _re.search(r'\{[^}]*"intent"\s*:\s*"(\w+)"[^}]*\}', raw, _re.IGNORECASE)
+        if m:
+            val = m.group(1).lower()
+            if val in ("query", "appeal", "chat"):
+                return val
+        # 关键词兜底
+        low = raw.lower()
+        if "query" in low:
+            return "query"
+        if "appeal" in low:
+            return "appeal"
+        return "chat"
+
+    async def _appeal_query_records(
+        self, event: AstrMessageEvent, sender_id: str, platform_id: str
+    ) -> MessageEventResult:
+        """查询并返回用户自己的警告/禁言记录。"""
+        key = self._record_key(platform_id, sender_id)
+        rec = self._records.get(key)
+        now = time.time()
+        if rec is None or (int(rec.get("count", 0)) == 0 and int(rec.get("total", 0)) == 0):
+            return event.plain_result("你目前没有任何警告记录。")
+
+        count = int(rec.get("count", 0))
+        total = int(rec.get("total", 0))
+        last_reason = rec.get("last_reason", "")
+        mute_until = float(rec.get("last_muted_until", 0) or 0)
+        is_muted = mute_until > now
+
+        lines = [f"📋 你的警告记录：", f"  当前警告次数 x = {count}", f"  历史累计 = {total}"]
+        if last_reason:
+            lines.append(f"  最近警告原因：{last_reason}")
+        if is_muted:
+            remain = int((mute_until - now) // 60)
+            lines.append(f"  🔇 当前处于禁言状态，剩余约 {remain} 分钟")
+        else:
+            lines.append("  当前未禁言")
+
+        # 列出该用户最近的警告日志（最多 5 条）
+        user_logs = [
+            l for l in self._logs
+            if str(l.get("user_id", "")) == sender_id
+            and str(l.get("platform_id", "")) == platform_id
+        ]
+        if user_logs:
+            lines.append(f"\n最近 {min(len(user_logs), 5)} 条警告详情：")
+            for l in user_logs[-5:]:
+                revoked_tag = " [已撤回]" if l.get("revoked") else ""
+                lines.append(
+                    f"  • {l.get('time_str', '')} | 原因：{l.get('reason', '')}{revoked_tag}"
+                )
+                msg = str(l.get("message", ""))
+                if msg:
+                    lines.append(f"    消息：{msg[:80]}")
+        lines.append("\n💡 如需申请撤回某条警告，请描述理由，例如：\"我想申诉，那条话不是针对别人的\"")
+        return event.plain_result("\n".join(lines))
+
+    async def _appeal_review_and_revoke(
+        self, event: AstrMessageEvent, message_str: str,
+        sender_id: str, platform_id: str, provider_id: str,
+    ) -> MessageEventResult:
+        """LLM 复核申诉：理由充分→自动撤回，不足→拒绝，难评判→转管理员。"""
+        cfg = self.config
+        key = self._record_key(platform_id, sender_id)
+        rec = self._records.get(key)
+
+        # 获取用户未撤回的警告日志
+        user_logs = [
+            l for l in self._logs
+            if str(l.get("user_id", "")) == sender_id
+            and str(l.get("platform_id", "")) == platform_id
+            and not l.get("revoked")
+        ]
+        if not user_logs:
+            return event.plain_result("你目前没有可申诉的警告记录。")
+
+        # 构建日志摘要供 LLM 选择
+        logs_summary = "\n".join(
+            f"[{i+1}] log_id={l.get('log_id', '')} | 原因：{l.get('reason', '')} | 消息：{str(l.get('message', ''))[:100]}"
+            for i, l in enumerate(user_logs[-10:])  # 最近10条
+        )
+
+        review_prompt = (
+            "你是警告申诉复核助手。用户想申请撤回一条警告。\n"
+            "请根据用户理由，选择最相关的一条警告，并判断是否应该撤回。\n\n"
+            f"用户的警告记录（最近未撤回的）：\n{logs_summary}\n\n"
+            f"用户的申诉消息：{message_str[:500]}\n\n"
+            "请返回 JSON：\n"
+            '{"decision": "revoke" | "insufficient" | "unclear", "log_id": "选中的log_id", "reason": "你的判断理由"}\n'
+            "判定标准：\n"
+            '- revoke：用户理由充分，消息确实不构成严重恶意（如正常聊天被误判、语境上下文说明无恶意）\n'
+            '- insufficient：用户理由不足或消息确实存在明显恶意（如辱骂/威胁内容确凿）\n'
+            '- unclear：难以判断，需要人工审核（如语境复杂、边界情况）\n'
+            "注意：只返回 JSON，不要有多余文字。"
+        )
+        try:
+            resp = await self.context.llm_generate(
+                chat_provider_id=provider_id, prompt=review_prompt, system_prompt="你是申诉复核助手，只输出JSON。"
+            )
+            raw = getattr(resp, "completion_text", "") or ""
+            review = self._parse_appeal_review(raw)
+        except Exception as e:
+            logger.warning(f"[恶意消息检测] 申诉复核 LLM 调用失败: {e}")
+            return event.plain_result("申诉复核服务暂时不可用，请稍后再试。")
+
+        if not review:
+            return event.plain_result("无法解析复核结果，请稍后再试。")
+
+        decision = review.get("decision", "unclear")
+        target_log_id = review.get("log_id", "")
+        review_reason = review.get("reason", "")
+
+        # 创建申诉记录
+        appeal_id = uuid.uuid4().hex[:10]
+        appeal = {
+            "appeal_id": appeal_id,
+            "user_id": sender_id,
+            "platform_id": platform_id,
+            "sender_name": event.get_sender_name() or "",
+            "message": message_str[:500],
+            "target_log_id": target_log_id,
+            "review_decision": decision,
+            "review_reason": review_reason,
+            "status": "pending",
+            "created_at": time.time(),
+            "resolved_at": 0.0,
+            "resolved_by": "",
+            "resolve_note": "",
+        }
+
+        if decision == "revoke" and bool(cfg.get("appeal_auto_revoke", True)):
+            # 理由充分，自动撤回
+            revoke_result = await self._appeal_execute_revoke(
+                event, target_log_id, sender_id, platform_id,
+                reason=f"申诉自动撤回：{review_reason}"
+            )
+            appeal["status"] = "auto_revoked"
+            appeal["resolved_at"] = time.time()
+            appeal["resolved_by"] = "llm_auto"
+            self._appeals.append(appeal)
+            if len(self._appeals) > 2000:
+                self._appeals = self._appeals[-2000:]
+            self._save()
+            if revoke_result.get("ok"):
+                return event.plain_result(
+                    f"✅ 申诉成功！已为你撤回该警告。\n"
+                    f"复核理由：{review_reason}\n"
+                    f"警告次数 {revoke_result.get('old_count')} → {revoke_result.get('new_count')}"
+                )
+            else:
+                return event.plain_result(
+                    f"申诉复核通过，但撤回执行遇到问题：{revoke_result.get('error', '未知错误')}\n"
+                    f"请联系管理员手动处理。"
+                )
+
+        elif decision == "insufficient":
+            # 理由不足，不撤回
+            appeal["status"] = "rejected"
+            appeal["resolved_at"] = time.time()
+            appeal["resolved_by"] = "llm_auto"
+            appeal["resolve_note"] = "理由不足"
+            self._appeals.append(appeal)
+            if len(self._appeals) > 2000:
+                self._appeals = self._appeals[-2000:]
+            self._save()
+            return event.plain_result(
+                f"❌ 申诉未通过。\n"
+                f"理由：{review_reason}\n"
+                f"你的警告内容确实存在恶意，不符合撤回标准。"
+            )
+
+        else:
+            # unclear → 转管理员审核
+            appeal["status"] = "pending_review"
+            self._appeals.append(appeal)
+            if len(self._appeals) > 2000:
+                self._appeals = self._appeals[-2000:]
+            self._save()
+
+            # 通知管理员
+            notified = await self._appeal_notify_admins(event, appeal, user_logs, review_reason)
+
+            if notified:
+                return event.plain_result(
+                    f"⏳ 你的申诉已提交，需要管理员人工审核。\n"
+                    f"申诉编号：{appeal_id}\n"
+                    f"复核意见：{review_reason}\n"
+                    f"请耐心等待审核结果。"
+                )
+            else:
+                return event.plain_result(
+                    f"⏳ 你的申诉已提交（编号：{appeal_id}），但暂未配置审核管理员。\n"
+                    f"请联系管理员在插件配置中设置申诉审核通知目标。"
+                )
+
+    @staticmethod
+    def _parse_appeal_review(raw: str) -> Optional[dict]:
+        """解析 LLM 复核结果 JSON。"""
+        raw = (raw or "").strip()
+        import re as _re
+        # 尝试提取 JSON 块
+        m = _re.search(r'\{[^{}]*"decision"[^{}]*\}', raw, _re.DOTALL)
+        if m:
+            try:
+                obj = json.loads(m.group(0))
+                if "decision" in obj:
+                    return obj
+            except Exception:
+                pass
+        # 关键词兜底
+        low = raw.lower()
+        if "revoke" in low:
+            return {"decision": "revoke", "log_id": "", "reason": raw[:200]}
+        if "insufficient" in low:
+            return {"decision": "insufficient", "log_id": "", "reason": raw[:200]}
+        if "unclear" in low:
+            return {"decision": "unclear", "log_id": "", "reason": raw[:200]}
+        return None
+
+    async def _appeal_notify_admins(
+        self, event: AstrMessageEvent, appeal: dict, user_logs: list, review_reason: str
+    ) -> bool:
+        """通知管理员（管理群 + 管理员私聊）。返回是否至少通知成功一处。"""
+        cfg = self.config
+        admin_groups = cfg.get("appeal_admin_groups", []) or []
+        admin_users = cfg.get("appeal_admin_users", []) or []
+        if not admin_groups and not admin_users:
+            return False
+
+        # 构建通知消息
+        target_log_id = appeal.get("target_log_id", "")
+        target_log = None
+        for l in user_logs:
+            if l.get("log_id") == target_log_id:
+                target_log = l
+                break
+        msg_lines = [
+            f"📨 新申诉审核请求",
+            f"申诉编号：{appeal['appeal_id']}",
+            f"用户：{appeal.get('sender_name', '')} ({appeal.get('user_id', '')})",
+            f"申诉消息：{appeal.get('message', '')}",
+        ]
+        if target_log:
+            msg_lines.append(f"被申诉警告：")
+            msg_lines.append(f"  原因：{target_log.get('reason', '')}")
+            msg_lines.append(f"  消息：{str(target_log.get('message', ''))[:150]}")
+        msg_lines.append(f"LLM复核意见：{review_reason}")
+        msg_lines.append(f"\n请评判：")
+        msg_lines.append(f"  通过：/申诉通过 {appeal['appeal_id']}")
+        msg_lines.append(f"  拒绝：/申诉拒绝 {appeal['appeal_id']}")
+        notify_text = "\n".join(msg_lines)
+
+        client = event.bot
+        notified = False
+
+        # 通知管理群
+        for gid_str in admin_groups:
+            try:
+                gid = int(gid_str)
+                await client.api.call_action("send_group_msg", group_id=gid, message=notify_text)
+                notified = True
+            except Exception as e:
+                logger.warning(f"[恶意消息检测] 申诉通知管理群 {gid_str} 失败: {e}")
+
+        # 私聊通知管理员
+        for uid_str in admin_users:
+            try:
+                uid = int(uid_str)
+                await client.api.call_action("send_private_msg", user_id=uid, message=notify_text)
+                notified = True
+            except Exception as e:
+                logger.warning(f"[恶意消息检测] 申诉通知管理员 {uid_str} 失败: {e}")
+
+        return notified
+
+    async def _appeal_execute_revoke(
+        self, event: AstrMessageEvent, log_id: str,
+        sender_id: str, platform_id: str, reason: str,
+    ) -> dict:
+        """执行撤回：count-1 + 标记 revoked + 误判列表 + 云同步 + 跨群解禁。"""
+        # 查找日志条目
+        target_log = None
+        for log_entry in self._logs:
+            if log_entry.get("log_id") == log_id:
+                target_log = log_entry
+                break
+        if target_log is None:
+            return {"ok": False, "error": "未找到该日志记录"}
+        if target_log.get("revoked"):
+            return {"ok": False, "error": "该警告已被撤回"}
+
+        message = str(target_log.get("message", ""))
+        uid = str(target_log.get("user_id", "")) or sender_id
+        pid = str(target_log.get("platform_id", "")) or platform_id
+        old_count = 0
+        new_count = 0
+
+        # 递减 count
+        if uid:
+            key = self._record_key(pid, uid)
+            rec = self._records.get(key)
+            if rec:
+                old_count = int(rec.get("count", 0) or 0)
+                new_count = max(0, old_count - 1)
+                rec["count"] = new_count
+                self._cloud_schedule_push(key)
+
+        # 标记日志为已撤回
+        target_log["revoked"] = True
+        target_log["revoke_reason"] = reason
+        target_log["revoked_at"] = time.time()
+
+        # 加入误判列表
+        if message and not self._is_false_positive(message):
+            self._false_positives.append({
+                "message": message,
+                "reason": reason,
+                "original_reason": target_log.get("reason", ""),
+                "user_id": uid,
+                "platform_id": pid,
+                "log_id": log_id,
+                "revoked_at": target_log["revoked_at"],
+            })
+            if len(self._false_positives) > 2000:
+                self._false_positives = self._false_positives[-2000:]
+
+        self._save()
+        logger.info(
+            f"[恶意消息检测] 申诉撤回 log_id={log_id} user={uid} count {old_count} -> {new_count}"
+        )
+
+        # 云端撤回
+        if self._cloud_enabled() and bool(self.config.get("enable_cloud_revoke", True)) and uid:
+            key = self._record_key(pid, uid)
+            await self._cloud_revoke_record(key, log_id, message, reason)
+
+        # ★ 跨群解禁：撤回警告时尝试解除禁言
+        try:
+            await self._unmute_user(event, uid, pid)
+        except Exception as e:
+            logger.warning(f"[恶意消息检测] 申诉撤回后解禁失败: {e}")
+
+        return {"ok": True, "old_count": old_count, "new_count": new_count}
+
+    async def _unmute_user(
+        self, event: AstrMessageEvent, sender_id: str, platform_id: str
+    ) -> None:
+        """跨群解禁：在机器人是管理员的群里解除目标用户的禁言。
+
+        参考 _cross_group_mute 的逻辑，但 duration=0 表示解除禁言。
+        """
+        try:
+            uid = int(sender_id)
+        except (TypeError, ValueError):
+            logger.warning(f"[恶意消息检测] 解禁：uid 转换失败: {sender_id}")
+            return
+
+        client = event.bot
+        try:
+            group_list = await client.api.call_action("get_group_list")
+        except Exception as e:
+            logger.warning(f"[恶意消息检测] 解禁：获取群列表失败: {e}")
+            return
+        if not isinstance(group_list, list):
+            return
+
+        self_id = event.get_self_id()
+        unmuted = 0
+        for g in group_list:
+            if not isinstance(g, dict):
+                continue
+            gid_str = str(g.get("group_id", ""))
+            if not gid_str:
+                continue
+            try:
+                gid = int(gid_str)
+            except (TypeError, ValueError):
+                continue
+
+            # 机器人是否为该群管理员
+            bot_admin = await self._bot_is_admin_in_group(client, platform_id, gid_str, self_id)
+            if not bot_admin:
+                continue
+
+            # 目标用户是否在该群
+            in_group = await self._user_in_group(client, gid, uid)
+            if not in_group:
+                continue
+
+            try:
+                await client.api.call_action(
+                    "set_group_ban",
+                    group_id=gid,
+                    user_id=uid,
+                    duration=0,  # 0 = 解除禁言
+                )
+                unmuted += 1
+                logger.info(f"[恶意消息检测] 解禁成功 uid={uid} gid={gid}")
+            except Exception as e:
+                logger.debug(f"[恶意消息检测] 解禁失败 gid={gid}: {e}")
+
+        # 重置本地禁言状态
+        key = self._record_key(platform_id, sender_id)
+        rec = self._records.get(key)
+        if rec:
+            rec["last_muted_until"] = 0
+            self._cloud_schedule_push(key)
+            self._save()
+
+        if unmuted > 0:
+            logger.info(f"[恶意消息检测] 跨群解禁完成 uid={uid} 共 {unmuted} 个群")
+
+    async def _appeal_approve(
+        self, event: AstrMessageEvent, appeal_id: str
+    ) -> MessageEventResult:
+        """管理员通过申诉。"""
+        appeal = None
+        for a in self._appeals:
+            if a.get("appeal_id") == appeal_id:
+                appeal = a
+                break
+        if appeal is None:
+            yield event.plain_result(f"未找到申诉编号 {appeal_id}。")
+            return
+        if appeal.get("status") not in ("pending", "pending_review"):
+            yield event.plain_result(f"申诉 {appeal_id} 已处理（状态：{appeal.get('status')}）。")
+            return
+
+        log_id = appeal.get("target_log_id", "")
+        uid = appeal.get("user_id", "")
+        pid = appeal.get("platform_id", "")
+        reason = f"管理员通过申诉：{appeal.get('review_reason', '')}"
+
+        revoke_result = await self._appeal_execute_revoke(event, log_id, uid, pid, reason)
+        appeal["status"] = "approved"
+        appeal["resolved_at"] = time.time()
+        appeal["resolved_by"] = event.get_sender_id()
+        self._save()
+
+        if revoke_result.get("ok"):
+            yield event.plain_result(
+                f"✅ 申诉 {appeal_id} 已通过并撤回警告。\n"
+                f"用户 {appeal.get('sender_name', '')} 的警告次数 {revoke_result.get('old_count')} → {revoke_result.get('new_count')}"
+            )
+        else:
+            yield event.plain_result(
+                f"✅ 申诉 {appeal_id} 已通过，但撤回执行遇到问题：{revoke_result.get('error', '未知')}"
+            )
+
+        # 通知申诉用户
+        try:
+            client = event.bot
+            notify = f"✅ 你的申诉（编号 {appeal_id}）已被管理员通过，警告已撤回。"
+            await client.api.call_action("send_private_msg", user_id=int(uid), message=notify)
+        except Exception:
+            pass
+
+    async def _appeal_reject(
+        self, event: AstrMessageEvent, appeal_id: str
+    ) -> MessageEventResult:
+        """管理员拒绝申诉。"""
+        appeal = None
+        for a in self._appeals:
+            if a.get("appeal_id") == appeal_id:
+                appeal = a
+                break
+        if appeal is None:
+            yield event.plain_result(f"未找到申诉编号 {appeal_id}。")
+            return
+        if appeal.get("status") not in ("pending", "pending_review"):
+            yield event.plain_result(f"申诉 {appeal_id} 已处理（状态：{appeal.get('status')}）。")
+            return
+
+        appeal["status"] = "rejected"
+        appeal["resolved_at"] = time.time()
+        appeal["resolved_by"] = event.get_sender_id()
+        appeal["resolve_note"] = "管理员拒绝"
+        self._save()
+
+        yield event.plain_result(f"❌ 申诉 {appeal_id} 已拒绝。")
+
+        # 通知申诉用户
+        try:
+            client = event.bot
+            notify = f"❌ 你的申诉（编号 {appeal_id}）已被管理员拒绝。"
+            await client.api.call_action("send_private_msg", user_id=int(appeal.get("user_id", "0")), message=notify)
+        except Exception:
+            pass
+
     # ------------------------------------------------------------------ 云同步 API
 
     async def _api_cloud_status(self):
@@ -3422,3 +4105,37 @@ class CheckMaliciousMessagePlugin(Star):
             yield event.plain_result(f"✅ {op}成功：{ip}")
         else:
             yield event.plain_result(f"⚠️ 未知操作：{action}\n用法：list / add <ip> / rm <ip>")
+
+    # ------------------------------------------------------------------ 申诉审核指令
+
+    @filter.command("appeal_list", alias={"申诉列表"})
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    async def appeal_list_cmd(self, event: AstrMessageEvent):
+        """查看待审核申诉列表（管理员）。"""
+        pending = [a for a in self._appeals if a.get("status") in ("pending", "pending_review")]
+        if not pending:
+            yield event.plain_result("暂无待审核的申诉。")
+            return
+        lines = [f"📋 待审核申诉（共 {len(pending)} 条）："]
+        for a in pending[-20:]:
+            lines.append(
+                f"  • {a['appeal_id']} | {a.get('sender_name', '')} ({a.get('user_id', '')}) "
+                f"| LLM意见：{a.get('review_decision', '')}"
+            )
+            lines.append(f"    申诉：{a.get('message', '')[:60]}")
+        lines.append("\n通过：/申诉通过 <id>  拒绝：/申诉拒绝 <id>")
+        yield event.plain_result("\n".join(lines))
+
+    @filter.command("appeal_approve", alias={"申诉通过"})
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    async def appeal_approve_cmd(self, event: AstrMessageEvent, appeal_id: str):
+        """通过申诉（管理员）。/申诉通过 <appeal_id>"""
+        async for result in self._appeal_approve(event, appeal_id):
+            yield result
+
+    @filter.command("appeal_reject", alias={"申诉拒绝"})
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    async def appeal_reject_cmd(self, event: AstrMessageEvent, appeal_id: str):
+        """拒绝申诉（管理员）。/申诉拒绝 <appeal_id>"""
+        async for result in self._appeal_reject(event, appeal_id):
+            yield result
