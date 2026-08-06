@@ -315,17 +315,20 @@ Header: X-Client-Token: <client_token>  或  X-Admin-Token: <admin_token>
 Body:
 {
   "bot_id": "bot_001",
-  "keys": ["qq:12345", "qq:67890"]
+  "keys": ["qq:12345", "qq:67890"]   // 可选；省略或为空时按 bot_id 统一衰减
 }
 ```
-将指定 key 的云端 count 各 -1（不低于 0），并 bump `updated_at` / `seq`。
+两种模式：
+- **按 keys 衰减**（`keys` 非空）：逐个校验后将指定 key 的 count -1；
+- **按 bot_id 统一衰减**（`keys` 为空/省略）：遍历所有记录，衰减 `sources` 包含该 `bot_id` 且 count>0 的记录。
 
+权限：
 - **admin_token**：跳过 sources 校验，可衰减任意记录（全局衰减权）；
 - **client_token**：强制校验 `bot_id` 必须在该记录的 `sources` 中，否则该 key 计入 `denied`（防止跨 bot 误衰减）；
-- 返回 `{"ok": true, "decayed": [...], "denied": [...]}`；
+- 返回 `{"ok": true, "decayed": [...], "denied": [...], "mode": "global"|"keys"}`；
 - 操作写入审计日志（`decay` / `decay_denied`）。
 
-> 该端点解决「服务端 x 不随本地衰减」问题：本地每次全局衰减时通过此端点推送衰减到云端，使云端 count 与本地保持一致。
+> 该端点解决「服务端 x 不随本地衰减」问题：客户端全局衰减时发送一次请求（不传 keys），服务端按 bot_id 统一衰减该 bot 上传的所有记录，使云端 count 与本地保持一致。
 
 ### 13. 管理员清零（管理员）
 ```

@@ -1169,11 +1169,16 @@ class Handler(BaseHTTPRequestHandler):
         })
 
     def _handle_decay(self):
-        """合法衰减：批量将指定 key 的 count -1。
+        """合法衰减：批量将记录的 count -1。
+
+        两种模式：
+        1. 按 keys 衰减：body 含非空 keys 列表，逐个校验后衰减。
+        2. 按 bot_id 统一衰减：keys 为空/缺失时，遍历所有记录，
+           admin_token 衰减全部；client_token 仅衰减 sources 包含 bot_id 的记录。
 
         鉴权：admin_token → 全局衰减权（跳过 sources 校验）；
               client_token → 强制校验 bot_id 在 record.sources 中（仅能衰减本 bot 上传的数据）。
-        body: {"bot_id": "...", "keys": ["k1", "k2", ...]}
+        body: {"bot_id": "...", "keys": ["k1", "k2", ...]}  # keys 可省略，省略时按 bot_id 统一衰减
         """
         body, err = self._read_body()
         if err:
@@ -1183,44 +1188,67 @@ class Handler(BaseHTTPRequestHandler):
         keys = body.get("keys") or []
         if isinstance(keys, str):
             keys = [keys]
-        if not isinstance(keys, list) or not keys:
-            return self._send_error_json(HTTPStatus.BAD_REQUEST, "missing keys")
         is_admin = self._check_admin_token()
+        # 模式判断：keys 非空 → 按 keys 衰减；keys 为空 → 按 bot_id 统一衰减
+        use_global = not keys or not isinstance(keys, list)
         decayed = []
         denied = []
         not_found = []
         ts = now_ts()
         with LOCK:
-            for k in keys:
-                rec = RECORDS.get(k)
-                if rec is None:
-                    not_found.append(k)
-                    continue
-                # 鉴权：非 admin 时校验 bot_id 在 sources 中
-                if not is_admin:
-                    sources = rec.get("sources") or []
-                    if bot_id not in sources:
-                        denied.append(k)
-                        audit_log("decay_denied", bot_id, {
-                            "record_key": k, "reason": "bot_id not in sources", "sources": sources,
-                        })
+            if use_global:
+                # 全局衰减：遍历所有记录，按 bot_id/admin 权限衰减 count>0 的记录
+                for k, rec in list(RECORDS.items()):
+                    old_count = int(rec.get("count", 0) or 0)
+                    if old_count <= 0:
                         continue
-                old_count = int(rec.get("count", 0) or 0)
-                new_count = max(0, old_count - 1)
-                rec["count"] = new_count
-                rec["updated_by"] = bot_id if not is_admin else "admin"
-                rec["updated_at"] = ts
-                rec["seq"] = next_seq()
-                decayed.append({"key": k, "old_count": old_count, "new_count": new_count})
+                    # 非 admin 时仅衰减 sources 包含 bot_id 的记录
+                    if not is_admin:
+                        sources = rec.get("sources") or []
+                        if bot_id not in sources:
+                            continue
+                    new_count = max(0, old_count - 1)
+                    rec["count"] = new_count
+                    rec["updated_by"] = bot_id if not is_admin else "admin"
+                    rec["updated_at"] = ts
+                    rec["seq"] = next_seq()
+                    decayed.append({"key": k, "old_count": old_count, "new_count": new_count})
+            else:
+                # 按 keys 衰减（原逻辑）
+                for k in keys:
+                    rec = RECORDS.get(k)
+                    if rec is None:
+                        not_found.append(k)
+                        continue
+                    # 鉴权：非 admin 时校验 bot_id 在 sources 中
+                    if not is_admin:
+                        sources = rec.get("sources") or []
+                        if bot_id not in sources:
+                            denied.append(k)
+                            audit_log("decay_denied", bot_id, {
+                                "record_key": k, "reason": "bot_id not in sources", "sources": sources,
+                            })
+                            continue
+                    old_count = int(rec.get("count", 0) or 0)
+                    if old_count <= 0:
+                        continue
+                    new_count = max(0, old_count - 1)
+                    rec["count"] = new_count
+                    rec["updated_by"] = bot_id if not is_admin else "admin"
+                    rec["updated_at"] = ts
+                    rec["seq"] = next_seq()
+                    decayed.append({"key": k, "old_count": old_count, "new_count": new_count})
             if decayed:
                 save_records()
         audit_log("decay", bot_id if not is_admin else "admin", {
             "decayed": len(decayed), "denied": len(denied), "not_found": len(not_found),
+            "mode": "global" if use_global else "keys",
         })
         log_request("POST", "/api/decay", 200, self.client_address[0],
-                    f"decayed={len(decayed)}, denied={len(denied)}, not_found={len(not_found)}")
+                    f"mode={'global' if use_global else 'keys'}, decayed={len(decayed)}, denied={len(denied)}, not_found={len(not_found)}")
         return self._send_json(HTTPStatus.OK, {
             "ok": True, "decayed": decayed, "denied": denied, "not_found": not_found,
+            "mode": "global" if use_global else "keys",
         })
 
     def _handle_upload_logs(self):
