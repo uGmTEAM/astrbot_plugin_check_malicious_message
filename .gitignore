@@ -1,0 +1,43 @@
+# ===== 绝对不能上传 =====
+# 运行时自动生成的数据（包含用户记录、警告信息、备案日志、IP黑名单等）
+warning_data.json
+warning_data.json.bak
+deepseek_balance_data.json
+cloud_server/data/
+cloud_server/logs/
+astrbot_plugin_deepseek_balance/data/
+astrbot_plugin_deepseek_balance/logs/
+
+# 若你替换了 config.json 里的真实 token/密钥，也要排除（当前仓库是占位符，可以上传）
+# cloud_server/config.json
+
+# ===== 不必要上传（本地缓存/临时产物） =====
+__pycache__/
+**/__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# IDE / Editor
+.trae/
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# 临时/测试脚本
+test_decay_by_bot_id.py
+test_decay_inproc.ps1
+
+# 打包/压缩产物
+cloud_server.zip
+*.zip
+*.tar.gz
+*.rar
+
+# 本地日志
+*.log
+logs/

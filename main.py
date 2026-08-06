@@ -138,8 +138,8 @@ class CheckMaliciousMessagePlugin(Star):
         # 待推送队列：在警告发生时累积，由后台任务统一推送
         self._cloud_pending_push: set[str] = set()  # 待推送记录的 key 集合
         self._cloud_pending_special: int = 0  # 待推送的特殊记录条数
-        # 待重试的合法衰减 key（_cloud_push_decay 失败时累积，full_sync 重试）
-        self._cloud_pending_decay: set[str] = set()
+        # 待重试的全局合法衰减标志（_cloud_push_decay 失败时置 True，full_sync 重试）
+        self._cloud_pending_global_decay: bool = False
 
         # 后台任务健康监控（验证计数器 + 心跳时间戳）
         # 用于检测并自愈「循环卡死 / 任务静默退出」问题
@@ -1564,15 +1564,15 @@ class CheckMaliciousMessagePlugin(Star):
             f"[恶意消息检测] 每 2 小时衰减完成: changed={changed}, decayed={len(decayed_keys)}, "
             f"last_decrement={self._fmt_ts(self._meta['last_decrement'])}"
         )
-        # ★ 合法衰减同步：把本次实际衰减的 key 推送到云端
+        # ★ 合法衰减同步：通知服务端按 bot_id 统一衰减（不传具体 keys）
         # 受 enable_cloud_revoke 控制（默认 True），不依赖 enable_cloud_sync_count
-        # 服务端会校验 bot_id in sources，仅衰减本 bot 上传的数据
+        # 服务端遍历 sources 包含本 bot_id 且 count>0 的记录统一 -1
         if decayed_keys and self._cloud_enabled() and self._cloud_feature_enabled("enable_cloud_revoke", True):
             try:
-                asyncio.create_task(self._cloud_push_decay(decayed_keys))
+                asyncio.create_task(self._cloud_push_decay())
             except RuntimeError:
-                # 事件循环未就绪时累积到 pending，由 full_sync 重试
-                self._cloud_pending_decay.update(decayed_keys)
+                # 事件循环未就绪时置 pending 标志，由 full_sync 重试
+                self._cloud_pending_global_decay = True
 
     def _apply_pending_decrements(self):
         """加载时补算停机期间应衰减的次数。"""
@@ -2242,36 +2242,35 @@ class CheckMaliciousMessagePlugin(Star):
         self._cloud_record_error(f"push_incremental: {msg}")
         return {"ok": False, "error": msg, "applied": 0}
 
-    async def _cloud_push_decay(self, keys: list[str]) -> dict:
-        """推送合法衰减到云端（POST /api/decay）。
+    async def _cloud_push_decay(self) -> dict:
+        """推送全局合法衰减到云端（POST /api/decay，不传 keys）。
 
-        服务端鉴权：bot_id 必须在 record.sources 中（仅能衰减本 bot 上传的数据）；
-        使用 admin_token 时跳过该校验。失败的 key 累积到 _cloud_pending_decay 供 full_sync 重试。
+        服务端按 bot_id 统一衰减所有该 bot 上传的记录（sources 包含 bot_id 且 count>0）；
+        使用 admin_token 时衰减全部记录。
+        失败时设置 _cloud_pending_global_decay 标志，由 full_sync 重试。
         """
-        if not keys or not self._cloud_enabled():
-            return {"ok": False, "error": "未启用或无 key"}
-        body = {"bot_id": self._cloud_bot_id(), "keys": list(keys)}
+        if not self._cloud_enabled():
+            return {"ok": False, "error": "未启用"}
+        # 不传 keys，触发服务端「按 bot_id 统一衰减」模式
+        body = {"bot_id": self._cloud_bot_id()}
         try:
             status, resp = await self._cloud_http_request("POST", "/api/decay", body=body)
         except Exception as e:
             self._cloud_record_error(f"decay: {e}")
-            self._cloud_pending_decay.update(keys)
+            self._cloud_pending_global_decay = True
             return {"ok": False, "error": str(e)}
         if status == 200 and resp.get("ok"):
             decayed = resp.get("decayed", []) or []
-            denied = resp.get("denied", []) or []
-            not_found = resp.get("not_found", []) or []
-            # 成功推送，清空 pending（denied/not_found 的 key 不再重试，属正常）
-            for k in keys:
-                self._cloud_pending_decay.discard(k)
+            self._cloud_pending_global_decay = False
+            mode = resp.get("mode", "global")
             logger.info(
-                f"[恶意消息检测] 合法衰减已同步云端: decayed={len(decayed)}, "
-                f"denied={len(denied)}, not_found={len(not_found)}"
+                f"[恶意消息检测] 合法衰减已同步云端（按 bot_id 统一衰减）: "
+                f"mode={mode}, decayed={len(decayed)}"
             )
-            return {"ok": True, "decayed": len(decayed), "denied": len(denied), "not_found": len(not_found)}
+            return {"ok": True, "decayed": len(decayed), "mode": mode}
         msg = resp.get("error") or f"HTTP {status}"
         self._cloud_record_error(f"decay: {msg}")
-        self._cloud_pending_decay.update(keys)
+        self._cloud_pending_global_decay = True
         return {"ok": False, "error": msg}
 
     async def _cloud_upload_logs(self) -> dict:
@@ -2377,11 +2376,10 @@ class CheckMaliciousMessagePlugin(Star):
                 if special_result.get("ok"):
                     self._cloud_pending_special = 0
 
-            # 5. 重试失败的合法衰减推送
+            # 5. 重试失败的全局合法衰减推送
             decay_result = {"ok": True, "decayed": 0}
-            if self._cloud_pending_decay:
-                pending_decay = list(self._cloud_pending_decay)
-                decay_result = await self._cloud_push_decay(pending_decay)
+            if self._cloud_pending_global_decay:
+                decay_result = await self._cloud_push_decay()
 
             # 6. 上传备案日志（新警告事件）
             logs_result = await self._cloud_upload_logs()

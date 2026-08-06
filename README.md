@@ -15,7 +15,7 @@
 - **特殊记录**：政治敏感/违法内容单独归档，按人分类以便举报；
 - **超时记录**：标准备案记录超 7 天自动归档，可一键清理；
 - **☁️ 多 bot 云同步**：自建云服务端后，多个 bot 可共享警告记录、禁言状态与特殊记录；
-- **⬇️ 合法衰减**：服务端 x 不随本地自动衰减，需通过「合法衰减」协议推送衰减到云端（仅同 bot_id 或 admin_token 可衰减）；
+- **⬇️ 合法衰减**：服务端 x 不随本地自动衰减，需通过「合法衰减」协议推送衰减到云端。客户端全局衰减时发送一次请求，服务端按 bot_id 统一衰减该 bot 上传的所有记录（仅同 bot_id 或 admin_token 可衰减）；
 - **🔧 管理员强制覆盖**：admin 清零 / 修改记录时通过 `admin_rev` 版本号强制下发，客户端下次同步时无条件覆盖本地数据；
 - **📄 备案页面**：将原警告记录页拆分为「警告次数统计」+「备案」两个独立标签页，备案页展示每次警告的句子与原因；
 - **👥 用户警告详情弹窗**：警告次数统计页面可点击被记录者名称，弹出窗口展示其每一次被警告的句子和原因（客户端 + 管理端均支持）；
@@ -44,7 +44,7 @@
 - 📦 **超时归档**：标准备案记录超过 7 天自动转移至超时记录页面，可一键清理。
 - 📋 **每日总结**：每日自动生成统计总结（警告次数、涉及人数、禁言次数、Top 10 用户）。
 - ↩️ **误判撤回**：被警告消息备案页可一键撤回误判，自动递减 count、标记消息以免再次误判、向云端发送撤回请求。
-- ⬇️ **合法衰减**：服务端 x 不随本地自动衰减，本地每次衰减时通过 `/api/decay` 协议推送到云端。仅上传该警告的 bot 或 admin_token 可衰减云端记录，防止跨 bot 误衰减。
+- ⬇️ **合法衰减**：服务端 x 不随本地自动衰减，本地每次全局衰减时通过 `/api/decay` 协议推送到云端（不传 keys，服务端按 bot_id 统一衰减该 bot 上传的所有记录）。仅上传该警告的 bot 或 admin_token 可衰减云端记录，防止跨 bot 误衰减。
 - 🔧 **管理员强制覆盖**：admin 通过 `admin_rev` 版本号强制下发记录变更，客户端检测到版本升级时无条件覆盖本地 count（绕过 max 合并规则）。
 - 📄 **备案页面**：服务端 WebUI 将「警告记录」拆分为「警告次数统计」+「备案」两页。备案页展示每次警告的句子与原因，支持搜索、按用户过滤、删除 7 天前日志。
 - 👥 **用户警告详情弹窗**：警告次数统计页面可点击被记录者名称，弹出窗口展示其每一次被警告的句子和原因（客户端插件页 + 服务端 WebUI 均支持）。
@@ -348,7 +348,7 @@ curl http://localhost:8765/api/health
 | `sources` | 累积所有贡献过的 bot_id |
 | 特殊记录 | 按 (cloud_bot_id, user_id, platform_id, time, message) 指纹去重 |
 | `admin_rev` | **强制覆盖**：客户端检测到 `remote.admin_rev > local.admin_rev` 时无条件采用远端 count（绕过 max 合并） |
-| 衰减 | **合法衰减协议**：本地每次衰减时通过 `POST /api/decay` 推送到云端，仅同 bot_id 或 admin_token 可衰减 |
+| 衰减 | **合法衰减协议**：本地每次全局衰减时通过 `POST /api/decay` 推送到云端（不传 keys），服务端按 bot_id 统一衰减该 bot 上传的所有记录，仅同 bot_id 或 admin_token 可衰减 |
 | 备案日志 | 按 `log_id` 去重，FIFO 截断至 50000 条 |
 
 ### 后台任务
@@ -376,7 +376,7 @@ LLM 可通过以下 Web API 自助调用云同步功能（AstrBot 自动转发�
 | GET | `cloud/blacklist` | Dashboard | 获取云端 IP 黑名单列表（需 admin_token） |
 | POST | `cloud/blacklist_add` | Dashboard | 添加 IP 到云端黑名单（body: `{"ip": "..."}`，需 admin_token） |
 | POST | `cloud/blacklist_remove` | Dashboard | 从云端黑名单移除 IP（body: `{"ip": "..."}`，需 admin_token） |
-| POST | `cloud/decay` | Dashboard | 推送合法衰减到云端（body: `{"keys": [...]}`，仅同 bot_id 或 admin_token 可衰减） |
+| POST | `cloud/decay` | Dashboard | 推送合法衰减到云端（body: `{"bot_id": "..."}`，不传 keys 时服务端按 bot_id 统一衰减该 bot 上传的所有记录；仅同 bot_id 或 admin_token 可衰减） |
 | POST | `cloud/zero_count` | Dashboard | 管理员清零记录并强制下发（body: `{"keys": [...]}`，需 admin_token，bump admin_rev） |
 | POST | `cloud/upload_logs` | Dashboard | 上传统计备案日志到云端（body: `{"logs": [...]}`，按 log_id 去重） |
 | GET | `cloud/logs` | Dashboard | 查询云端备案日志（支持 user_id/platform_id 过滤） |

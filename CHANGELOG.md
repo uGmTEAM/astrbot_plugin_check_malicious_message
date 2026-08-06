@@ -7,12 +7,15 @@
 - **⬇️ 合法衰减机制**：服务端的警告次数（x）不再随本地衰减而自动减少，而是通过「合法衰减」协议同步。
   - **合法衰减定义**：本地上传的数据只能由同一标识 `bot_id` 的任意端、或持有 `admin_token` 的管理端、或调用 API 衰减；
   - **服务端**（`cloud_server/server.py`）：
-    - 新增 `POST /api/decay` 端点（admin_token 或 client_token 鉴权）；
+    - 新增 `POST /api/decay` 端点（admin_token 或 client_token 鉴权），支持两种模式：
+      - **按 keys 衰减**（`keys` 非空）：逐个校验后将指定 key 的 count -1；
+      - **按 bot_id 统一衰减**（`keys` 为空/省略）：遍历所有记录，衰减 `sources` 包含该 `bot_id` 且 count>0 的记录；
     - 非 admin 请求强制校验 `bot_id` 在记录的 `sources` 中，否则拒绝（`denied`）；
     - admin 衰减跳过 sources 校验，可衰减任意记录；
+    - 返回新增 `mode` 字段（`"global"` 或 `"keys"`）标识衰减模式；
   - **客户端**（`main.py`）：
-    - 本地每次执行全局衰减时，通过 `_cloud_push_decay()` 推送衰减到云端；
-    - 推送失败时记录到 `_cloud_pending_decay` 集合，下次同步重试；
+    - 本地每次执行全局衰减时，通过 `_cloud_push_decay()` 推送衰减到云端（**不传 keys**，触发服务端按 bot_id 统一衰减）；
+    - 推送失败时设置 `_cloud_pending_global_decay` 标志，下次同步重试；
     - 衰减权限校验：仅上传该警告的 bot 才能衰减云端记录。
 
 - **🔧 管理员强制覆盖（admin_rev）**：管理员修改记录时，客户端下次同步强制下载被 admin 变更的条目。
